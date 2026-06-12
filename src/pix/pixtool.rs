@@ -374,7 +374,7 @@ impl PixTool {
         }
 
         // Sort by modification time, newest first
-        captures.sort_by(|a, b| b.modified.cmp(&a.modified));
+        captures.sort_by_key(|c| std::cmp::Reverse(c.modified));
 
         Ok(captures)
     }
