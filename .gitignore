@@ -1,0 +1,9 @@
+# Rust build artifacts
+/target
+
+# PIX capture files
+*.wpix
+
+# Editor / OS noise
+*.swp
+.DS_Store
