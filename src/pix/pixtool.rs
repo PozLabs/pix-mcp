@@ -17,11 +17,9 @@ pub struct PixTool;
 /// Format a `--option="value"` pixtool argument with the value wrapped in
 /// literal double quotes.
 ///
-/// pixtool keeps a quoted value intact even when it contains spaces. Without
-/// the quotes — or with the quotes around the whole `--option=value` token, as
-/// `Command::arg` would produce on Windows — pixtool (verified on 2603.25)
-/// re-splits the value on spaces and rejects everything after the first space
-/// as an "Unknown option".
+/// pixtool wants the quotes around the *value* (`--option="foo bar"`), not the
+/// whole `--option=value` token (`"--option=foo bar"`, which is what
+/// `Command::arg` produces on Windows). See [`push_value_option`].
 fn quoted_value_option(option: &str, value: &str) -> String {
     format!("{option}=\"{value}\"")
 }
@@ -43,6 +41,48 @@ fn push_value_option(cmd: &mut Command, option: &str, value: &str) {
 #[cfg(not(windows))]
 fn push_value_option(cmd: &mut Command, option: &str, value: &str) {
     cmd.arg(format!("{option}={value}"));
+}
+
+/// pixtool 2603.25 rejects a `--command-line` value that contains a space or
+/// starts with `-`/`+` (verified). Detect that so callers can warn the agent
+/// and suggest the documented workarounds (`autoexec.cfg`, or env vars).
+fn command_line_unsupported(value: &str) -> bool {
+    value.contains(' ') || value.starts_with('-') || value.starts_with('+')
+}
+
+/// Warning to surface when app args can't be passed via `--command-line` on
+/// pixtool 2603.25, or `None` when they are safe.
+fn command_line_warning(args: &[&str]) -> Option<String> {
+    if args.is_empty() {
+        return None;
+    }
+    let joined = args.join(" ");
+    if command_line_unsupported(&joined) {
+        Some(format!(
+            "pixtool 2603.25 cannot pass these app arguments via --command-line \
+             (values with spaces or starting with -/+ are rejected): {joined:?}. \
+             They were sent anyway but pixtool may ignore them or error. Workarounds: put the \
+             startup command in the app's autoexec/config file, or have the app read settings \
+             from an environment variable."
+        ))
+    } else {
+        None
+    }
+}
+
+/// pixtool analysis/playback verbs (save-event-list, save-resource,
+/// save-screenshot, list-counters, run-debug-layer, ...) fail without Windows
+/// Developer Mode. Map that failure to actionable guidance.
+pub fn check_developer_mode(stdout: &str, stderr: &str) -> Result<()> {
+    let combined = format!("{}\n{}", stdout, stderr).to_lowercase();
+    if combined.contains("developer mode") || combined.contains("requires_developer_mode") {
+        return Err(anyhow!(
+            "pixtool analysis requires Windows Developer Mode. Enable it (Settings → For \
+             developers → Developer Mode) and retry. Capturing does not need it; only \
+             open-capture analysis (event lists, screenshots, counters) does."
+        ));
+    }
+    Ok(())
 }
 
 impl PixTool {
@@ -137,16 +177,22 @@ impl PixTool {
             let _ = child.wait_with_output();
         });
 
+        let mut message = format!(
+            "Launched {} under pixtool (pixtool PID: {} — this is the launcher process, not \
+             the game). For a programmatic GPU capture use pix_gpu_capture_launch or \
+             pix_capture_and_analyze: PIX can only GPU-capture a process it launched itself, \
+             so attaching by PID to a separately-started game will fail.",
+            exe_path.display(),
+            pid
+        );
+        if let Some(w) = command_line_warning(args) {
+            message.push_str("\n\nWARNING: ");
+            message.push_str(&w);
+        }
+
         Ok(LaunchResult {
             process_id: pid,
-            message: format!(
-                "Launched {} under pixtool (pixtool PID: {} — this is the launcher process, not \
-                 the game). For a programmatic GPU capture use pix_gpu_capture_launch or \
-                 pix_capture_and_analyze: PIX can only GPU-capture a process it launched itself, \
-                 so attaching by PID to a separately-started game will fail.",
-                exe_path.display(),
-                pid
-            ),
+            message,
         })
     }
 
@@ -175,7 +221,10 @@ impl PixTool {
             push_value_option(&mut cmd, "--working-directory", &dir.display().to_string());
         }
 
-        // If a destination is provided, save the capture taken from start to it.
+        // Acquire the frame, then optionally save it. --captureFromStart only
+        // arms capture before the app runs; take-capture is what actually
+        // records a frame (per the pixtool 2603.25 reference).
+        cmd.arg("take-capture");
         if let Some(file) = capture_file {
             cmd.arg("save-capture");
             cmd.arg(file);
@@ -199,7 +248,7 @@ impl PixTool {
             let _ = child.wait_with_output();
         });
 
-        let message = match capture_file {
+        let mut message = match capture_file {
             Some(file) => format!(
                 "Launched {} with PIX capturing from start (PID: {}); capture will be saved to {}",
                 exe_path.display(),
@@ -212,6 +261,10 @@ impl PixTool {
                 pid
             ),
         };
+        if let Some(w) = command_line_warning(args) {
+            message.push_str("\n\nWARNING: ");
+            message.push_str(&w);
+        }
 
         Ok(LaunchResult {
             process_id: pid,
@@ -338,14 +391,20 @@ impl PixTool {
             .map_err(|e| anyhow!("Failed to run pixtool: {}", e))?;
 
         if output.status.success() {
+            let mut message = format!("GPU capture saved to {}", output_path.display());
+            if let Some(w) = command_line_warning(args) {
+                message.push_str("\n\nWARNING: ");
+                message.push_str(&w);
+            }
             Ok(CaptureResult {
                 output_path: output_path.to_path_buf(),
-                message: format!("GPU capture saved to {}", output_path.display()),
+                message,
                 stdout: String::from_utf8_lossy(&output.stdout).to_string(),
             })
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
+            check_developer_mode(&stdout, &stderr)?;
             Err(anyhow!(
                 "pixtool capture failed:\nstderr: {}\nstdout: {}",
                 stderr,
@@ -355,11 +414,11 @@ impl PixTool {
     }
 
     /// Take a timing capture of a running process
-    /// Uses: pixtool attach <PID> take-new-timing-capture <file.wpix>
+    /// Uses: pixtool attach <PID> take-new-timing-capture <file.wpix> [--duration=<ms>]
     pub fn timing_capture_process(
         process_id: u32,
         output_path: &Path,
-        duration_seconds: Option<u32>,
+        duration_ms: Option<u32>,
     ) -> Result<CaptureResult> {
         let pixtool = Self::find()?;
 
@@ -375,7 +434,8 @@ impl PixTool {
             .arg("take-new-timing-capture")
             .arg(output_path);
 
-        if let Some(duration) = duration_seconds {
+        // pixtool's --duration is in milliseconds (default 100), not seconds.
+        if let Some(duration) = duration_ms {
             cmd.arg(format!("--duration={}", duration));
         }
 
@@ -518,5 +578,29 @@ mod tests {
             quoted_value_option("--working-directory", "C:\\Program Files\\My Game"),
             "--working-directory=\"C:\\Program Files\\My Game\""
         );
+    }
+
+    #[test]
+    fn test_command_line_unsupported_detects_spaces_and_leading_dash_plus() {
+        // pixtool 2603.25 rejects values with spaces or starting with -/+.
+        assert!(command_line_unsupported("foo bar"));
+        assert!(command_line_unsupported("-windowed"));
+        assert!(command_line_unsupported("+runworld"));
+        assert!(!command_line_unsupported("foobar"));
+        assert!(!command_line_unsupported("level1"));
+    }
+
+    #[test]
+    fn test_command_line_warning_only_for_risky_args() {
+        assert!(command_line_warning(&[]).is_none());
+        assert!(command_line_warning(&["foobar"]).is_none());
+        assert!(command_line_warning(&["-windowed", "+runworld"]).is_some());
+    }
+
+    #[test]
+    fn test_check_developer_mode_maps_error() {
+        assert!(check_developer_mode("ok", "").is_ok());
+        assert!(check_developer_mode("", "E_PIX_FEATURE_REQUIRES_DEVELOPER_MODE").is_err());
+        assert!(check_developer_mode("Please enable Developer Mode", "").is_err());
     }
 }

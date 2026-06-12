@@ -52,9 +52,9 @@ pub struct TimingCaptureArgs {
     /// Path to save the capture file (.wpix extension).
     #[serde(default)]
     pub output_path: Option<String>,
-    /// Duration of the timing capture in seconds.
+    /// Duration of the timing capture in milliseconds (pixtool default: 100).
     #[serde(default)]
-    pub duration_seconds: Option<u32>,
+    pub duration_ms: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -164,8 +164,7 @@ pub async fn handle_pix_gpu_capture_launch(args: GpuCaptureLaunchArgs) -> Result
 
 pub async fn handle_pix_timing_capture(args: TimingCaptureArgs) -> Result<CaptureReport> {
     let output_path = require_output_path(args.output_path)?;
-    let result =
-        PixTool::timing_capture_process(args.process_id, &output_path, args.duration_seconds)?;
+    let result = PixTool::timing_capture_process(args.process_id, &output_path, args.duration_ms)?;
 
     Ok(CaptureReport {
         success: true,

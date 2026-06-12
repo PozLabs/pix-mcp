@@ -110,6 +110,22 @@ Add to `claude_desktop_config.json`:
   elicitation; otherwise a clear, model-correctable tool error is returned.
 - **Token-efficient** — list tools paginate and can write full data to files instead of inlining it.
 
+## pixtool compatibility (2603.25)
+
+Command/flag usage is matched to the installed binary — see
+[`pixtool-reference.md`](pixtool-reference.md), a verbatim dump of `pixtool --help`. Notes that
+affect this server:
+
+- **Analysis needs Developer Mode.** `save-event-list`, `save-screenshot`, `save-resource`,
+  `list-counters`, and `run-debug-layer` fail without Windows Developer Mode; the server detects
+  this and returns actionable guidance. Capturing does not need it.
+- **App arguments with spaces / leading `-`/`+` can't be passed via `--command-line`** on 2603.25.
+  The capture tools still send them, but warn in the result; prefer the app's own `autoexec`/config
+  file or an environment variable to select a level/mode.
+- **GPU capture by PID requires launch-under-PIX** (`pix_gpu_capture` only works on a process PIX
+  launched). Use `pix_gpu_capture_launch` / `pix_capture_and_analyze` for a normal game.
+- **Timing capture `duration_ms` is in milliseconds** (pixtool default 100).
+
 ## MCP Resources
 
 | Resource URI | Description |
