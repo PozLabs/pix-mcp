@@ -95,7 +95,7 @@ Add to `claude_desktop_config.json`:
 | `pix_get_event_list` | Extract D3D12 event list (paginated via `offset`/`limit`/`response_format`, or save full CSV) |
 | `pix_list_counters` | List available performance counters (supports `filter`/`limit`) |
 | `pix_run_analysis` | Run debug layer analysis, detect D3D12 errors |
-| `pix_get_screenshot` | Extract a frame as PNG **and return it inline as an image** for vision models |
+| `pix_get_screenshot` | Extract the frame **recorded with the capture** as PNG (`save-screenshot`) and return it inline as an image; `depth`/`marker` options save a render target/depth buffer via replay |
 | `pix_export_counters` | Parse PIX-exported counters (CSV/JSON) |
 | `pix_compare_captures` | Compare two captures for regression detection |
 
