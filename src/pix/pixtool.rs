@@ -14,6 +14,37 @@ static PIXTOOL_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// Wrapper for pixtool.exe operations
 pub struct PixTool;
 
+/// Format a `--option="value"` pixtool argument with the value wrapped in
+/// literal double quotes.
+///
+/// pixtool keeps a quoted value intact even when it contains spaces. Without
+/// the quotes — or with the quotes around the whole `--option=value` token, as
+/// `Command::arg` would produce on Windows — pixtool (verified on 2603.25)
+/// re-splits the value on spaces and rejects everything after the first space
+/// as an "Unknown option".
+fn quoted_value_option(option: &str, value: &str) -> String {
+    format!("{option}=\"{value}\"")
+}
+
+/// Append a `--option="value"` argument to `cmd`, preserving the literal quotes
+/// around the value in the actual command line.
+///
+/// On Windows this needs `raw_arg`: `Command::arg` would quote the entire
+/// `--option=value` token (`"--option=foo bar"`) instead of just the value
+/// (`--option="foo bar"`), which pixtool mishandles.
+#[cfg(windows)]
+fn push_value_option(cmd: &mut Command, option: &str, value: &str) {
+    use std::os::windows::process::CommandExt;
+    cmd.raw_arg(quoted_value_option(option, value));
+}
+
+/// Non-Windows fallback (pixtool is Windows-only; this keeps the crate building
+/// on other platforms for development and tests).
+#[cfg(not(windows))]
+fn push_value_option(cmd: &mut Command, option: &str, value: &str) {
+    cmd.arg(format!("{option}={value}"));
+}
+
 impl PixTool {
     /// Find pixtool.exe in the PIX installation
     pub fn find() -> Result<PathBuf> {
@@ -77,18 +108,16 @@ impl PixTool {
 
         let mut cmd = Command::new(&pixtool);
         cmd.arg("launch");
-
-        // Set working directory via pixtool option (not cmd.current_dir)
-        if let Some(dir) = working_dir {
-            cmd.arg(format!("--working-directory={}", dir.display()));
-        }
-
-        // Set command line args via pixtool option
-        if !args.is_empty() {
-            cmd.arg(format!("--command-line={}", args.join(" ")));
-        }
-
         cmd.arg(exe_path);
+
+        // Pass app args and working directory as quoted-value options *after*
+        // the exe, matching the form pixtool accepts (quotes around the value).
+        if !args.is_empty() {
+            push_value_option(&mut cmd, "--command-line", &args.join(" "));
+        }
+        if let Some(dir) = working_dir {
+            push_value_option(&mut cmd, "--working-directory", &dir.display().to_string());
+        }
 
         // Use null for stdio to fully detach the process
         cmd.stdout(Stdio::null());
@@ -132,18 +161,16 @@ impl PixTool {
 
         let mut cmd = Command::new(&pixtool);
         cmd.arg("launch");
+        cmd.arg(exe_path);
         // Begin capturing as soon as the app starts rendering.
         cmd.arg("--captureFromStart");
 
-        if let Some(dir) = working_dir {
-            cmd.arg(format!("--working-directory={}", dir.display()));
-        }
-
         if !args.is_empty() {
-            cmd.arg(format!("--command-line={}", args.join(" ")));
+            push_value_option(&mut cmd, "--command-line", &args.join(" "));
         }
-
-        cmd.arg(exe_path);
+        if let Some(dir) = working_dir {
+            push_value_option(&mut cmd, "--working-directory", &dir.display().to_string());
+        }
 
         // If a destination is provided, save the capture taken from start to it.
         if let Some(file) = capture_file {
@@ -269,20 +296,17 @@ impl PixTool {
 
         let mut cmd = Command::new(&pixtool);
         cmd.arg("launch");
+        cmd.arg(exe_path);
 
-        // Pass working directory and app arguments via pixtool options so they
-        // are not mistaken for pixtool sub-commands (consistent with `launch`).
-        if let Some(dir) = working_dir {
-            cmd.arg(format!("--working-directory={}", dir.display()));
-        }
+        // App args / working directory as quoted-value options after the exe.
         if !args.is_empty() {
-            cmd.arg(format!("--command-line={}", args.join(" ")));
+            push_value_option(&mut cmd, "--command-line", &args.join(" "));
+        }
+        if let Some(dir) = working_dir {
+            push_value_option(&mut cmd, "--working-directory", &dir.display().to_string());
         }
 
-        cmd.arg(exe_path)
-            .arg("take-capture")
-            .arg("save-capture")
-            .arg(output_path);
+        cmd.arg("take-capture").arg("save-capture").arg(output_path);
 
         let output = cmd
             .output()
@@ -452,5 +476,22 @@ mod tests {
             println!("Found pixtool at: {}", path.display());
             assert!(path.exists());
         }
+    }
+
+    #[test]
+    fn test_quoted_value_option_wraps_value_in_quotes() {
+        // The quotes must wrap the value, not the whole token, so pixtool keeps
+        // space-containing values intact (regression test for the 2603.25 bug).
+        assert_eq!(
+            quoted_value_option(
+                "--command-line",
+                "+runworld worlds\\RetailSinglePlayer\\c01"
+            ),
+            "--command-line=\"+runworld worlds\\RetailSinglePlayer\\c01\""
+        );
+        assert_eq!(
+            quoted_value_option("--working-directory", "C:\\Program Files\\My Game"),
+            "--working-directory=\"C:\\Program Files\\My Game\""
+        );
     }
 }
