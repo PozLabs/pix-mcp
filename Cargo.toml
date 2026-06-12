@@ -1,6 +1,6 @@
 [package]
 name = "pix-mcp"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Model Context Protocol (MCP) server for debugging DirectX 12 apps with Microsoft PIX"
 license = "MIT"
