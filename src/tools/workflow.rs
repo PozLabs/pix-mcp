@@ -84,14 +84,16 @@ pub async fn handle_pix_capture_and_analyze(
             .with_extension("png")
             .to_string_lossy()
             .to_string();
-        match super::analysis::handle_pix_get_screenshot(
-            capture_path.clone(),
-            png,
-            false,
-            None,
-            false,
-            1280,
-        )
+        match super::analysis::handle_pix_get_screenshot(super::analysis::ScreenshotRequest {
+            capture_path: capture_path.clone(),
+            output_path: png,
+            depth: false,
+            marker: None,
+            global_id: None,
+            rtv_index: None,
+            embed_image: false,
+            max_dimension: 1280,
+        })
         .await
         {
             Ok(res) => Some(res.report.output_path),

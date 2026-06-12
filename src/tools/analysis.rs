@@ -9,7 +9,7 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::pix::pixtool::unique_temp_path;
+use crate::pix::pixtool::{check_developer_mode, unique_temp_path};
 use crate::pix::PixTool;
 
 /// How much detail to return inline from list-style tools.
@@ -61,7 +61,8 @@ pub struct AnalyzeCaptureArgs {
     /// Include performance counters (slower but more detailed).
     #[serde(default)]
     pub include_counters: Option<bool>,
-    /// Counter group pattern (e.g., "D3D*", "*GPU*").
+    /// Counter name pattern, e.g. "*" (all), "D3D*". Passed to pixtool
+    /// `save-event-list --counters=<pattern>`.
     #[serde(default)]
     pub counter_pattern: Option<String>,
 }
@@ -74,7 +75,8 @@ pub struct EventListArgs {
     /// path is returned instead of inlining rows (token-efficient for big lists).
     #[serde(default)]
     pub output_path: Option<String>,
-    /// Counter group pattern to include (e.g., "*", "D3D*").
+    /// Counter name pattern to include, e.g. "*" (all), "D3D*". Passed to
+    /// pixtool `save-event-list --counters=<pattern>`.
     #[serde(default)]
     pub counters: Option<String>,
     /// Inline detail level when no output_path is given.
@@ -99,10 +101,18 @@ pub struct ScreenshotArgs {
     /// `save-resource --depth`, which replays the capture). Default: false.
     #[serde(default)]
     pub depth: Option<bool>,
-    /// Save the resource at the end of a named PIX marker region instead of the
+    /// Save the resource bound under a named PIX marker region instead of the
     /// recorded screenshot (uses `save-resource --marker=<name>`).
     #[serde(default)]
     pub marker: Option<String>,
+    /// Save the resource bound at a specific draw's Global ID (uses
+    /// `save-resource --global-id=<id>`). Get IDs from pix_get_event_list.
+    #[serde(default)]
+    pub global_id: Option<u64>,
+    /// RenderTargetView index to save when a draw binds multiple RTVs (uses
+    /// `save-resource --rtv=<index>`). Only applies on the save-resource path.
+    #[serde(default)]
+    pub rtv_index: Option<u64>,
     /// Embed the image inline so a vision model can see it (default: true).
     #[serde(default)]
     pub embed_image: Option<bool>,
@@ -442,7 +452,7 @@ pub async fn handle_pix_analyze_capture(args: AnalyzeCaptureArgs) -> Result<Anal
     cmd.arg("open-capture").arg(&args.capture_path);
     cmd.arg("save-event-list").arg(&event_csv);
     if include_counters {
-        cmd.arg(format!("--counter-groups={}", counter_pattern));
+        cmd.arg(format!("--counters={}", counter_pattern));
     }
 
     let output = cmd
@@ -450,6 +460,7 @@ pub async fn handle_pix_analyze_capture(args: AnalyzeCaptureArgs) -> Result<Anal
         .map_err(|e| anyhow::anyhow!("Failed to run pixtool: {}", e))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    check_developer_mode(&stdout, &stderr)?;
 
     let events = if event_csv.exists() {
         let content = std::fs::read_to_string(&event_csv)?;
@@ -506,20 +517,24 @@ pub async fn handle_pix_get_event_list(args: EventListArgs) -> Result<EventListR
     cmd.arg("open-capture").arg(&args.capture_path);
     cmd.arg("save-event-list").arg(&csv_path);
     if let Some(pattern) = args.counters.as_deref() {
-        cmd.arg(format!("--counter-groups={}", pattern));
+        cmd.arg(format!("--counters={}", pattern));
     }
 
     let output = cmd
         .output()
         .map_err(|e| anyhow::anyhow!("Failed to run pixtool: {}", e))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(anyhow::anyhow!("pixtool failed:\n{}\n{}", stdout, stderr));
-    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    check_developer_mode(&stdout, &stderr)?;
+    // Some pixtool analysis verbs return a non-zero exit code even on success,
+    // so trust the produced file rather than the exit status.
     if !csv_path.exists() {
-        return Err(anyhow::anyhow!("Failed to generate event list"));
+        return Err(anyhow::anyhow!(
+            "Failed to generate event list.\nstdout: {}\nstderr: {}",
+            stdout,
+            stderr
+        ));
     }
 
     let content = std::fs::read_to_string(&csv_path)?;
@@ -589,14 +604,30 @@ pub async fn handle_pix_get_event_list(args: EventListArgs) -> Result<EventListR
 // Screenshot (with inline image content)
 // ---------------------------------------------------------------------------
 
-pub async fn handle_pix_get_screenshot(
-    capture_path: String,
-    output_path: String,
-    depth: bool,
-    marker: Option<String>,
-    embed_image: bool,
-    max_dimension: u32,
-) -> Result<ScreenshotResult> {
+/// Inputs for [`handle_pix_get_screenshot`].
+pub struct ScreenshotRequest {
+    pub capture_path: String,
+    pub output_path: String,
+    pub depth: bool,
+    pub marker: Option<String>,
+    pub global_id: Option<u64>,
+    pub rtv_index: Option<u64>,
+    pub embed_image: bool,
+    pub max_dimension: u32,
+}
+
+pub async fn handle_pix_get_screenshot(req: ScreenshotRequest) -> Result<ScreenshotResult> {
+    let ScreenshotRequest {
+        capture_path,
+        output_path,
+        depth,
+        marker,
+        global_id,
+        rtv_index,
+        embed_image,
+        max_dimension,
+    } = req;
+
     let path = PathBuf::from(&capture_path);
     if !path.exists() {
         return Err(capture_not_found(&capture_path));
@@ -615,13 +646,21 @@ pub async fn handle_pix_get_screenshot(
     // Two documented paths:
     //  - `save-screenshot <png>`: the screenshot recorded when the capture was
     //    taken (fast, no replay). This is the reliable default.
-    //  - `save-resource <png> [--depth] [--marker=<name>]`: replays the capture
-    //    and saves a render target / depth buffer.
-    let used_save_resource = depth || marker.is_some();
+    //  - `save-resource <png> [--rtv=N] [--depth] [--global-id=ID] [--marker=name]`:
+    //    replays the capture and saves a render target / depth buffer for a
+    //    specific draw.
+    let used_save_resource =
+        depth || marker.is_some() || global_id.is_some() || rtv_index.is_some();
     if used_save_resource {
         cmd.arg("save-resource").arg(&output_path);
+        if let Some(n) = rtv_index {
+            cmd.arg(format!("--rtv={}", n));
+        }
         if depth {
             cmd.arg("--depth");
+        }
+        if let Some(id) = global_id {
+            cmd.arg(format!("--global-id={}", id));
         }
         if let Some(ref m) = marker {
             cmd.arg(format!("--marker={}", m));
@@ -638,6 +677,7 @@ pub async fn handle_pix_get_screenshot(
     if !output_file.exists() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
+        check_developer_mode(&stdout, &stderr)?;
         return Err(anyhow::anyhow!(
             "Failed to save screenshot.\nstdout: {}\nstderr: {}",
             stdout,
@@ -707,6 +747,8 @@ pub async fn handle_pix_list_counters(args: ListCountersArgs) -> Result<Counters
         .map_err(|e| anyhow::anyhow!("Failed to run pixtool: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    check_developer_mode(&stdout, &stderr)?;
     let all: Vec<String> = stdout
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -729,7 +771,9 @@ pub async fn handle_pix_list_counters(args: ListCountersArgs) -> Result<Counters
     let returned_list: Vec<String> = filtered.into_iter().take(limit).collect();
 
     Ok(CountersReport {
-        success: output.status.success(),
+        // pixtool analysis verbs can exit non-zero even on success; treat having
+        // parsed counters as success.
+        success: !returned_list.is_empty() || total_count > 0,
         capture_path: args.capture_path,
         total_count,
         returned: returned_list.len(),
@@ -753,6 +797,7 @@ pub async fn handle_pix_run_analysis(args: CapturePathArgs) -> Result<RunAnalysi
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    check_developer_mode(&stdout, &stderr)?;
 
     let errors: Vec<String> = stdout
         .lines()
@@ -768,7 +813,9 @@ pub async fn handle_pix_run_analysis(args: CapturePathArgs) -> Result<RunAnalysi
         .collect();
 
     Ok(RunAnalysisReport {
-        success: output.status.success(),
+        // run-debug-layer "doesn't generate output but validates playback"; its
+        // exit code is unreliable, so report based on detected issues instead.
+        success: errors.is_empty(),
         capture_path: args.capture_path,
         analysis: AnalysisDetail {
             error_count: errors.len(),
@@ -802,16 +849,19 @@ pub fn analyze_frame_insights(capture_path: &str, include_counters: bool) -> Res
     cmd.arg("open-capture").arg(capture_path);
     cmd.arg("save-event-list").arg(&csv);
     if include_counters {
-        cmd.arg("--counter-groups=*");
+        cmd.arg("--counters=*");
     }
     let output = cmd
         .output()
         .map_err(|e| anyhow::anyhow!("Failed to run pixtool: {}", e))?;
 
     if !csv.exists() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        check_developer_mode(&stdout, &stderr)?;
         return Err(anyhow::anyhow!(
-            "pixtool did not produce an event list: {}",
+            "pixtool did not produce an event list.\nstdout: {}\nstderr: {}",
+            stdout,
             stderr
         ));
     }

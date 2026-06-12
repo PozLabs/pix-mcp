@@ -271,8 +271,9 @@ impl PixServer {
         name = "pix_get_screenshot",
         description = "Extract the frame recorded with the capture as a PNG (pixtool \
                        save-screenshot) and return it inline as an image so a vision model can \
-                       inspect the render. Set depth=true or marker=<name> to instead save a \
-                       render target / depth buffer via capture replay (save-resource).",
+                       inspect the render. Set depth=true, marker=<name>, global_id=<id>, or \
+                       rtv_index=<n> to instead save a specific render target / depth buffer via \
+                       capture replay (save-resource).",
         annotations(title = "Get screenshot", read_only_hint = true),
         execution(task_support = "optional")
     )]
@@ -296,16 +297,20 @@ impl PixServer {
         let max_dim = args.max_dimension.unwrap_or(1280);
         let depth = args.depth.unwrap_or(false);
         let marker = args.marker.clone();
+        let global_id = args.global_id;
+        let rtv_index = args.rtv_index;
         let capture_path = args.capture_path;
 
-        match analysis::handle_pix_get_screenshot(
+        match analysis::handle_pix_get_screenshot(analysis::ScreenshotRequest {
             capture_path,
             output_path,
             depth,
             marker,
-            embed,
-            max_dim,
-        )
+            global_id,
+            rtv_index,
+            embed_image: embed,
+            max_dimension: max_dim,
+        })
         .await
         {
             Ok(res) => {
