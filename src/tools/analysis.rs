@@ -95,12 +95,14 @@ pub struct ScreenshotArgs {
     /// Path to save the PNG screenshot. If omitted, the server may ask for it.
     #[serde(default)]
     pub output_path: Option<String>,
-    /// RenderTargetView index to save (default: 0 = main backbuffer).
+    /// Save the depth buffer instead of the color screenshot (uses pixtool
+    /// `save-resource --depth`, which replays the capture). Default: false.
     #[serde(default)]
-    pub rtv_index: Option<u64>,
-    /// Global event ID to extract from (default: last event with a bound RTV).
+    pub depth: Option<bool>,
+    /// Save the resource at the end of a named PIX marker region instead of the
+    /// recorded screenshot (uses `save-resource --marker=<name>`).
     #[serde(default)]
-    pub event_id: Option<u64>,
+    pub marker: Option<String>,
     /// Embed the image inline so a vision model can see it (default: true).
     #[serde(default)]
     pub embed_image: Option<bool>,
@@ -590,8 +592,8 @@ pub async fn handle_pix_get_event_list(args: EventListArgs) -> Result<EventListR
 pub async fn handle_pix_get_screenshot(
     capture_path: String,
     output_path: String,
-    rtv_index: Option<u64>,
-    event_id: Option<u64>,
+    depth: bool,
+    marker: Option<String>,
     embed_image: bool,
     max_dimension: u32,
 ) -> Result<ScreenshotResult> {
@@ -606,17 +608,26 @@ pub async fn handle_pix_get_screenshot(
         format!("{}.png", output_path)
     };
 
-    let rtv = rtv_index.unwrap_or(0);
-
     let pixtool = PixTool::find()?;
     let mut cmd = std::process::Command::new(&pixtool);
-    cmd.arg("open-capture")
-        .arg(&capture_path)
-        .arg("save-resource")
-        .arg(&output_path)
-        .arg(format!("--rtv={}", rtv));
-    if let Some(id) = event_id {
-        cmd.arg(format!("--global-id={}", id));
+    cmd.arg("open-capture").arg(&capture_path);
+
+    // Two documented paths:
+    //  - `save-screenshot <png>`: the screenshot recorded when the capture was
+    //    taken (fast, no replay). This is the reliable default.
+    //  - `save-resource <png> [--depth] [--marker=<name>]`: replays the capture
+    //    and saves a render target / depth buffer.
+    let used_save_resource = depth || marker.is_some();
+    if used_save_resource {
+        cmd.arg("save-resource").arg(&output_path);
+        if depth {
+            cmd.arg("--depth");
+        }
+        if let Some(ref m) = marker {
+            cmd.arg(format!("--marker={}", m));
+        }
+    } else {
+        cmd.arg("save-screenshot").arg(&output_path);
     }
 
     let output = cmd
@@ -628,7 +639,7 @@ pub async fn handle_pix_get_screenshot(
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         return Err(anyhow::anyhow!(
-            "Failed to save screenshot (no RTV bound at this event?).\nstdout: {}\nstderr: {}",
+            "Failed to save screenshot.\nstdout: {}\nstderr: {}",
             stdout,
             stderr
         ));
@@ -652,7 +663,11 @@ pub async fn handle_pix_get_screenshot(
             success: true,
             output_path,
             file_size_bytes: metadata.len(),
-            message: "Screenshot saved (backbuffer extracted)".to_string(),
+            message: if used_save_resource {
+                "Resource saved (render target / depth via capture replay)".to_string()
+            } else {
+                "Screenshot saved (frame recorded at capture time)".to_string()
+            },
             image_embedded: image_b64.is_some(),
         },
         image_b64,

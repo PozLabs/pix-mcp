@@ -87,7 +87,7 @@ pub async fn handle_pix_capture_and_analyze(
         match super::analysis::handle_pix_get_screenshot(
             capture_path.clone(),
             png,
-            None,
+            false,
             None,
             false,
             1280,
