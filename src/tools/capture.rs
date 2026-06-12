@@ -38,6 +38,11 @@ pub struct GpuCaptureLaunchArgs {
     /// Working directory for the executable.
     #[serde(default)]
     pub working_dir: Option<String>,
+    /// Bound the capture to this many frames (e.g. 1). Recommended so pixtool
+    /// finishes promptly and closes the launched app instead of running until
+    /// the app exits.
+    #[serde(default)]
+    pub frames: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -145,6 +150,7 @@ pub async fn handle_pix_gpu_capture_launch(args: GpuCaptureLaunchArgs) -> Result
         &cmd_args_ref,
         &output_path,
         working_dir.as_deref(),
+        args.frames,
     )?;
 
     Ok(CaptureReport {

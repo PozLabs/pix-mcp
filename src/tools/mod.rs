@@ -103,8 +103,10 @@ impl PixServer {
 
     #[tool(
         name = "pix_launch",
-        description = "Launch an executable with PIX attached for GPU capture. The app runs \
-                       with PIX instrumentation enabled so captures can be taken.",
+        description = "Launch an executable under pixtool. NOTE: this returns pixtool's launcher \
+                       PID, not the game's, and does not leave a process you can later GPU-capture \
+                       by PID. For a programmatic GPU capture use pix_gpu_capture_launch or \
+                       pix_capture_and_analyze (PIX can only capture a process it launched).",
         annotations(title = "Launch with PIX", destructive_hint = true)
     )]
     async fn pix_launch(
@@ -129,8 +131,10 @@ impl PixServer {
 
     #[tool(
         name = "pix_gpu_capture",
-        description = "Take a GPU capture of a running DX12 process (by PID) using pixtool.exe \
-                       and save it to a .wpix file.",
+        description = "Take a GPU capture of a process PIX already launched (by PID), saving a \
+                       .wpix file. IMPORTANT: PIX can only GPU-capture a process it launched \
+                       itself; attaching to an independently-started game fails with PIXTOOL17. \
+                       For a normal game, prefer pix_gpu_capture_launch or pix_capture_and_analyze.",
         annotations(title = "GPU capture (PID)"),
         execution(task_support = "optional")
     )]
