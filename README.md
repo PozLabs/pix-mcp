@@ -155,16 +155,16 @@ Agent: "Debug the rendering issue in my game"
    → Opens in PIX for analysis
 ```
 
-**Alternative: Capture a running process**
-```
-1. pix_launch({ exe_path: "C:\\MyGame\\game.exe" })
-   → Launches game with PIX attached
-
-2. [Find the game's PID, e.g., 12345]
-
-3. pix_gpu_capture({ process_id: 12345, output_path: "C:\\Captures\\issue.wpix" })
-   → Captures GPU commands from running process
-```
+> **GPU capture requires launching under PIX.** PIX can only take a GPU capture of a
+> process that PIX itself launched, so the single-shot tools above
+> (`pix_capture_and_analyze`, `pix_gpu_capture_launch`) are the reliable path.
+> `pix_gpu_capture` (attach by PID) only works on a process PIX already launched —
+> attaching to an independently-started game fails with `PIXTOOL17 - Process not
+> launched for GPU Capture`. `pix_launch` returns pixtool's launcher PID, not the
+> game's, and does not leave a process you can later capture by PID.
+>
+> Tip: pass `frames: 1` to the capture tools to bound the capture and let the
+> launched app close promptly.
 
 ## Environment Variables
 

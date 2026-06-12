@@ -25,6 +25,10 @@ pub struct CaptureAndAnalyzeArgs {
     /// Also extract a screenshot of the final frame (default: true).
     #[serde(default)]
     pub include_screenshot: Option<bool>,
+    /// Bound the capture to this many frames (e.g. 1) so pixtool finishes
+    /// promptly and closes the launched app.
+    #[serde(default)]
+    pub frames: Option<u32>,
 }
 
 /// Combined result of launch + capture + analysis.
@@ -62,8 +66,13 @@ pub async fn handle_pix_capture_and_analyze(
     let working_dir = args.working_dir.map(PathBuf::from);
 
     // 1. Launch + capture.
-    let capture =
-        PixTool::gpu_capture_launch(&exe, &cmd_args_ref, &output_path, working_dir.as_deref())?;
+    let capture = PixTool::gpu_capture_launch(
+        &exe,
+        &cmd_args_ref,
+        &output_path,
+        working_dir.as_deref(),
+        args.frames,
+    )?;
     let capture_path = capture.output_path.to_string_lossy().to_string();
 
     // 2. Heuristic frame analysis (with counters for timing).

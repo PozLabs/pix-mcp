@@ -140,7 +140,10 @@ impl PixTool {
         Ok(LaunchResult {
             process_id: pid,
             message: format!(
-                "Launched {} with PIX attached (PID: {})",
+                "Launched {} under pixtool (pixtool PID: {} — this is the launcher process, not \
+                 the game). For a programmatic GPU capture use pix_gpu_capture_launch or \
+                 pix_capture_and_analyze: PIX can only GPU-capture a process it launched itself, \
+                 so attaching by PID to a separately-started game will fail.",
                 exe_path.display(),
                 pid
             ),
@@ -267,6 +270,19 @@ impl PixTool {
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
+            let combined = format!("{} {}", stdout, stderr).to_lowercase();
+            if combined.contains("pixtool17") || combined.contains("not launched for gpu capture") {
+                return Err(anyhow!(
+                    "Cannot GPU-capture PID {}: the process was not launched under PIX \
+                     (PIXTOOL17 - Process not launched for GPU Capture). PIX can only take a GPU \
+                     capture of a process that PIX itself launched. Use pix_gpu_capture_launch or \
+                     pix_capture_and_analyze to launch the app under PIX and capture in one step.\n\
+                     stdout: {}\nstderr: {}",
+                    process_id,
+                    stdout,
+                    stderr
+                ));
+            }
             Err(anyhow!(
                 "pixtool capture failed:\nstderr: {}\nstdout: {}",
                 stderr,
@@ -282,6 +298,7 @@ impl PixTool {
         args: &[&str],
         output_path: &Path,
         working_dir: Option<&Path>,
+        frames: Option<u32>,
     ) -> Result<CaptureResult> {
         if !exe_path.exists() {
             return Err(anyhow!("Executable not found: {}", exe_path.display()));
@@ -306,7 +323,15 @@ impl PixTool {
             push_value_option(&mut cmd, "--working-directory", &dir.display().to_string());
         }
 
-        cmd.arg("take-capture").arg("save-capture").arg(output_path);
+        cmd.arg("take-capture");
+        // Bound the capture to N frames so pixtool finishes promptly and tears
+        // down the app it launched (matches working pixtool scripts:
+        // `take-capture --frames=N`). Without it, take-capture may run until the
+        // app exits, hanging the tool call and leaving the process alive.
+        if let Some(n) = frames {
+            cmd.arg(format!("--frames={}", n));
+        }
+        cmd.arg("save-capture").arg(output_path);
 
         let output = cmd
             .output()
