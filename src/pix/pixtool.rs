@@ -16,6 +16,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 
+use crate::security;
+
 static PIXTOOL_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 static PIXTOOL_FOREGROUND_CONCURRENCY: Semaphore = Semaphore::const_new(2);
 static PIXTOOL_BACKGROUND_CONCURRENCY: Semaphore = Semaphore::const_new(4);
@@ -324,55 +326,37 @@ fn has_extension_ignore_ascii_case(path: &Path, expected: &str) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
 }
 
-fn validate_executable(path: &Path) -> Result<()> {
-    if path_is_blank(path) {
-        return Err(anyhow!("Executable path must not be empty"));
-    }
-    if !path.is_file() {
-        return Err(anyhow!(
-            "Executable not found or not a file: {}",
-            path.display()
-        ));
-    }
-    Ok(())
+fn validate_executable(path: &Path) -> Result<PathBuf> {
+    security::validate_executable(path)
 }
 
-fn validate_working_directory(path: Option<&Path>) -> Result<()> {
+fn validate_working_directory(path: Option<&Path>) -> Result<Option<PathBuf>> {
     let Some(path) = path else {
-        return Ok(());
+        return Ok(None);
     };
-    if path_is_blank(path) {
-        return Err(anyhow!("Working directory must not be empty"));
-    }
-    if !path.is_dir() {
-        return Err(anyhow!(
-            "Working directory not found or not a directory: {}",
-            path.display()
-        ));
-    }
-    validate_raw_value("Working directory", &path.to_string_lossy())
+    let path = security::validate_working_directory(path)?;
+    validate_raw_value("Working directory", &path.to_string_lossy())?;
+    Ok(Some(path))
 }
 
-fn validate_capture_input(path: &Path) -> Result<()> {
-    if path_is_blank(path) {
-        return Err(anyhow!("Capture path must not be empty"));
-    }
-    if !path.is_file() {
-        return Err(anyhow!(
-            "Capture not found or not a file: {}",
-            path.display()
-        ));
-    }
+fn validate_capture_input(path: &Path) -> Result<PathBuf> {
     if !has_extension_ignore_ascii_case(path, "wpix") {
         return Err(anyhow!(
             "Capture path must have a .wpix extension: {}",
             path.display()
         ));
     }
-    Ok(())
+    let path = security::validate_input_file(path, "Capture path")?;
+    if !has_extension_ignore_ascii_case(&path, "wpix") {
+        return Err(anyhow!(
+            "Capture path resolves to a file without a .wpix extension: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
 }
 
-fn validate_new_capture_output(path: &Path) -> Result<()> {
+fn validate_new_capture_output(path: &Path) -> Result<PathBuf> {
     if path_is_blank(path) || path.file_name().is_none() {
         return Err(anyhow!("Capture output path must not be empty"));
     }
@@ -383,7 +367,8 @@ fn validate_new_capture_output(path: &Path) -> Result<()> {
         ));
     }
 
-    match std::fs::symlink_metadata(path) {
+    let path = security::validate_output_file(path, "Capture output path")?;
+    match std::fs::symlink_metadata(&path) {
         Ok(_) => {
             return Err(anyhow!(
                 "Capture output already exists; choose a new path: {}",
@@ -410,7 +395,7 @@ fn validate_new_capture_output(path: &Path) -> Result<()> {
             parent.display()
         ));
     }
-    Ok(())
+    Ok(path)
 }
 
 fn verify_new_capture_output(path: &Path) -> Result<()> {
@@ -441,7 +426,7 @@ struct PendingCaptureOutput {
 
 impl PendingCaptureOutput {
     fn new(destination: &Path) -> Result<Self> {
-        validate_new_capture_output(destination)?;
+        let destination = validate_new_capture_output(destination)?;
         let parent = destination
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -458,7 +443,7 @@ impl PendingCaptureOutput {
         // randomized name and removes any partial file on cancellation/error.
         std::fs::remove_file(&temporary)?;
         Ok(Self {
-            destination: destination.to_path_buf(),
+            destination,
             _directory: directory,
             temporary,
         })
@@ -468,7 +453,7 @@ impl PendingCaptureOutput {
         self.temporary.as_ref()
     }
 
-    fn verify_and_persist(self) -> Result<()> {
+    fn verify_and_persist(self) -> Result<PathBuf> {
         verify_new_capture_output(&self.temporary)?;
         let destination = self.destination.clone();
         self.temporary
@@ -479,7 +464,8 @@ impl PendingCaptureOutput {
                     destination.display(),
                     error
                 )
-            })
+            })?;
+        Ok(destination)
     }
 }
 
@@ -581,6 +567,9 @@ async fn run_pixtool_command_with_pid(
             ));
         }
     };
+    // Keep the bounded raw streams for internal parsers and classifiers.
+    // Sanitization is applied only when diagnostics cross the MCP boundary;
+    // truncating here would silently discard counters or late replay errors.
     let stdout = join_output_reader(stdout_reader, "stdout").await?;
     let stderr = join_output_reader(stderr_reader, "stderr").await?;
     if status.success() {
@@ -594,6 +583,10 @@ async fn run_pixtool_command_with_pid(
             stderr,
         },
     ))
+}
+
+fn public_process_output(bytes: &[u8]) -> String {
+    security::sanitize_process_output(&String::from_utf8_lossy(bytes))
 }
 
 async fn spawn_background_pixtool(mut command: Command, operation: &'static str) -> Result<u32> {
@@ -744,7 +737,6 @@ impl PixTool {
                 return Ok(path);
             }
             tracing::warn!(
-                path = %path.display(),
                 "PIXTOOL_PATH does not point to a file; searching installed PIX versions"
             );
         }
@@ -791,25 +783,26 @@ impl PixTool {
         args: &[&str],
         working_dir: Option<&Path>,
     ) -> Result<LaunchResult> {
-        validate_executable(exe_path)?;
-        validate_working_directory(working_dir)?;
+        security::ensure_user_launch_allowed()?;
+        let exe_path = validate_executable(exe_path)?;
+        let working_dir = validate_working_directory(working_dir)?;
         let command_line = validate_command_line_args(args)?;
         let pixtool = Self::find()?;
 
         let mut cmd = Command::new(&pixtool);
         cmd.arg("launch");
-        cmd.arg(exe_path);
+        cmd.arg(&exe_path);
 
         // Pass app args and working directory as quoted-value options *after*
         // the exe, matching the form pixtool accepts (quotes around the value).
         if let Some(command_line) = command_line.as_deref() {
             push_value_option(&mut cmd, "--command-line", command_line)?;
         }
-        if let Some(dir) = working_dir {
+        if let Some(dir) = working_dir.as_deref() {
             push_value_option(&mut cmd, "--working-directory", &dir.display().to_string())?;
         }
 
-        tracing::info!("Launching via pixtool: {:?}", exe_path);
+        tracing::info!("Launching a policy-approved executable via pixtool");
 
         let pid = spawn_background_pixtool(cmd, "pixtool launch").await?;
 
@@ -835,22 +828,23 @@ impl PixTool {
         capture_file: Option<&Path>,
         working_dir: Option<&Path>,
     ) -> Result<LaunchResult> {
-        validate_executable(exe_path)?;
-        validate_working_directory(working_dir)?;
+        security::ensure_user_launch_allowed()?;
+        let exe_path = validate_executable(exe_path)?;
+        let working_dir = validate_working_directory(working_dir)?;
         let command_line = validate_command_line_args(args)?;
         let mut pending_output = capture_file.map(PendingCaptureOutput::new).transpose()?;
         let pixtool = Self::find()?;
 
         let mut cmd = Command::new(&pixtool);
         cmd.arg("launch");
-        cmd.arg(exe_path);
+        cmd.arg(&exe_path);
         // Begin capturing as soon as the app starts rendering.
         cmd.arg("--captureFromStart");
 
         if let Some(command_line) = command_line.as_deref() {
             push_value_option(&mut cmd, "--command-line", command_line)?;
         }
-        if let Some(dir) = working_dir {
+        if let Some(dir) = working_dir.as_deref() {
             push_value_option(&mut cmd, "--working-directory", &dir.display().to_string())?;
         }
 
@@ -872,10 +866,10 @@ impl PixTool {
             cmd.arg("--open");
         }
 
-        tracing::info!("Launching with capture via pixtool: {:?}", exe_path);
+        tracing::info!("Launching a policy-approved executable with capture via pixtool");
 
         let (pid, message) = match capture_file {
-            Some(file) => {
+            Some(_) => {
                 let (pid, output) = run_pixtool_command_with_pid(
                     cmd,
                     PIXTOOL_OPERATION_TIMEOUT,
@@ -885,11 +879,11 @@ impl PixTool {
                 if !output.status.success() {
                     return Err(anyhow!(
                         "pixtool launch-and-capture failed:\nstderr: {}\nstdout: {}",
-                        String::from_utf8_lossy(&output.stderr),
-                        String::from_utf8_lossy(&output.stdout)
+                        public_process_output(&output.stderr),
+                        public_process_output(&output.stdout)
                     ));
                 }
-                pending_output
+                let file = pending_output
                     .take()
                     .expect("capture destination has a pending-output guard")
                     .verify_and_persist()?;
@@ -926,7 +920,7 @@ impl PixTool {
 
     /// Open a capture file in the PIX GUI
     pub async fn open_capture(capture_path: &Path) -> Result<()> {
-        validate_capture_input(capture_path)?;
+        let capture_path = validate_capture_input(capture_path)?;
         // Find WinPix.exe (GUI) in same directory as pixtool
         let pixtool = Self::find()?;
         let pix_dir = pixtool
@@ -940,7 +934,7 @@ impl PixTool {
 
         let mut command = Command::new(&winpix);
         command
-            .arg(capture_path)
+            .arg(&capture_path)
             .kill_on_drop(false)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -967,11 +961,7 @@ impl PixTool {
         let pending_output = PendingCaptureOutput::new(output_path)?;
         let pixtool = Self::find()?;
 
-        tracing::info!(
-            "Starting GPU capture of PID {} to {:?}",
-            process_id,
-            output_path
-        );
+        tracing::info!(process_id, "Starting GPU capture");
 
         let mut command = Command::new(&pixtool);
         command
@@ -984,11 +974,11 @@ impl PixTool {
             run_pixtool_command(command, PIXTOOL_OPERATION_TIMEOUT, "pixtool GPU capture").await?;
 
         if output.status.success() {
-            pending_output.verify_and_persist()?;
+            let output_path = pending_output.verify_and_persist()?;
             Ok(CaptureResult {
-                output_path: output_path.to_path_buf(),
+                output_path: output_path.clone(),
                 message: format!("GPU capture saved to {}", output_path.display()),
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                stdout: public_process_output(&output.stdout),
             })
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1002,14 +992,14 @@ impl PixTool {
                      pix_capture_and_analyze to launch the app under PIX and capture in one step.\n\
                      stdout: {}\nstderr: {}",
                     process_id,
-                    stdout,
-                    stderr
+                    security::sanitize_process_output(&stdout),
+                    security::sanitize_process_output(&stderr)
                 ));
             }
             Err(anyhow!(
                 "pixtool capture failed:\nstderr: {}\nstdout: {}",
-                stderr,
-                stdout
+                security::sanitize_process_output(&stderr),
+                security::sanitize_process_output(&stdout)
             ))
         }
     }
@@ -1023,28 +1013,25 @@ impl PixTool {
         working_dir: Option<&Path>,
         frames: Option<u32>,
     ) -> Result<CaptureResult> {
-        validate_executable(exe_path)?;
-        validate_working_directory(working_dir)?;
+        security::ensure_user_launch_allowed()?;
+        let exe_path = validate_executable(exe_path)?;
+        let working_dir = validate_working_directory(working_dir)?;
         let pending_output = PendingCaptureOutput::new(output_path)?;
         let command_line = validate_command_line_args(args)?;
         let frames = validate_frames(frames)?;
         let pixtool = Self::find()?;
 
-        tracing::info!(
-            "Launching {:?} with GPU capture to {:?}",
-            exe_path,
-            output_path
-        );
+        tracing::info!("Launching a policy-approved executable with GPU capture");
 
         let mut cmd = Command::new(&pixtool);
         cmd.arg("launch");
-        cmd.arg(exe_path);
+        cmd.arg(&exe_path);
 
         // App args / working directory as quoted-value options after the exe.
         if let Some(command_line) = command_line.as_deref() {
             push_value_option(&mut cmd, "--command-line", command_line)?;
         }
-        if let Some(dir) = working_dir {
+        if let Some(dir) = working_dir.as_deref() {
             push_value_option(&mut cmd, "--working-directory", &dir.display().to_string())?;
         }
 
@@ -1061,12 +1048,12 @@ impl PixTool {
                 .await?;
 
         if output.status.success() {
-            pending_output.verify_and_persist()?;
+            let output_path = pending_output.verify_and_persist()?;
             let message = format!("GPU capture saved to {}", output_path.display());
             Ok(CaptureResult {
-                output_path: output_path.to_path_buf(),
+                output_path,
                 message,
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                stdout: public_process_output(&output.stdout),
             })
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1074,8 +1061,8 @@ impl PixTool {
             check_developer_mode(&stdout, &stderr)?;
             Err(anyhow!(
                 "pixtool capture failed:\nstderr: {}\nstdout: {}",
-                stderr,
-                stdout
+                security::sanitize_process_output(&stderr),
+                security::sanitize_process_output(&stdout)
             ))
         }
     }
@@ -1092,11 +1079,7 @@ impl PixTool {
         let duration_ms = validate_duration(duration_ms)?;
         let pixtool = Self::find()?;
 
-        tracing::info!(
-            "Starting timing capture of PID {} to {:?}",
-            process_id,
-            output_path
-        );
+        tracing::info!(process_id, "Starting timing capture");
 
         let mut cmd = Command::new(&pixtool);
         cmd.arg("attach")
@@ -1112,34 +1095,29 @@ impl PixTool {
         let output = run_pixtool_command(cmd, timeout_duration, "pixtool timing capture").await?;
 
         if output.status.success() {
-            pending_output.verify_and_persist()?;
+            let output_path = pending_output.verify_and_persist()?;
             Ok(CaptureResult {
-                output_path: output_path.to_path_buf(),
+                output_path: output_path.clone(),
                 message: format!("Timing capture saved to {}", output_path.display()),
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                stdout: public_process_output(&output.stdout),
             })
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
             Err(anyhow!(
                 "pixtool timing-capture failed:\nstderr: {}\nstdout: {}",
-                stderr,
-                stdout
+                security::sanitize_process_output(&stderr),
+                security::sanitize_process_output(&stdout)
             ))
         }
     }
 
     /// List all capture files in a directory
     pub fn list_captures(dir: &Path) -> Result<Vec<CaptureInfo>> {
-        if path_is_blank(dir) || !dir.is_dir() {
-            return Err(anyhow!(
-                "Capture directory not found or not a directory: {}",
-                dir.display()
-            ));
-        }
+        let dir = security::validate_input_directory(dir, "Capture directory")?;
         let mut captures = Vec::new();
 
-        for (index, entry) in std::fs::read_dir(dir)?.enumerate() {
+        for (index, entry) in std::fs::read_dir(&dir)?.enumerate() {
             if index >= MAX_CAPTURE_DIRECTORY_ENTRIES {
                 return Err(anyhow!(
                     "Capture directory contains more than {} entries; choose a narrower directory",

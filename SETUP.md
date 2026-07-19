@@ -39,7 +39,9 @@ npx @modelcontextprotocol/inspector cargo run --locked --release
 
 ## Runtime constraints
 
-- Foreground `pixtool` operations use a two-process pool and wait up to 30 seconds for a permit
+- MCP tool calls have a process-wide concurrency limit of eight by default; configure a value in
+  `1..=64` with `PIX_MCP_MAX_CONCURRENT_TOOLS`. Calls wait at most 30 seconds for a global slot.
+  Foreground `pixtool` operations use a two-process pool and wait up to 30 seconds for a permit
   before their execution timeout starts. Background launches use a separate four-process pool; a
   fifth concurrent background launch fails immediately instead of waiting.
 - MCP request cancellation drops the active tool future. Foreground `pixtool` operations time out
@@ -50,6 +52,9 @@ npx @modelcontextprotocol/inspector cargo run --locked --release
 - Capture analysis requires Windows Developer Mode for `save-event-list`, `save-screenshot`,
   `save-resource`, `list-counters`, and `run-debug-layer`. Timing captures require elevation;
   ordinary GPU capture does not.
+- User-controlled application launch is blocked when the server is elevated. This does not block
+  timing capture by PID. Prefer separate elevated and non-elevated server configurations; only set
+  `PIX_MCP_ALLOW_ELEVATED_LAUNCH=true` when every allowed executable is trusted.
 - GPU capture `frames` defaults to pixtool's default of 1 and must be in `1..=120`.
   Timing-capture `duration_ms` defaults to 100 milliseconds and must be in `1..=600000`.
 - pixtool 2603.25 cannot faithfully represent application arguments containing spaces, beginning
@@ -75,11 +80,37 @@ npx @modelcontextprotocol/inspector cargo run --locked --release
 - `pix_compare_captures` compares file-size and modification metadata only. It does not establish a
   performance regression; compare equivalent event timings and GPU counters for that analysis.
 
-## Trust model
+## Local security policy
 
-Use `pix-mcp` only with a trusted MCP client. The client can intentionally launch executables and
-read or write local paths with the permissions of the account running the server. Input validation
-does not make the server a sandbox, and there is no executable or filesystem allowlist.
+Use `pix-mcp` only with a trusted MCP client. Input validation and allowlists are defense in depth,
+not an OS sandbox. The following environment variables configure the local boundary:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `PIX_MCP_CAPTURES_DIR` | process working directory | Existing directory used by `pix_list_captures` and `capture://` resources |
+| `PIX_MCP_INPUT_ROOTS` | unrestricted local paths | Semicolon-separated existing roots for capture/counter inputs |
+| `PIX_MCP_OUTPUT_ROOTS` | unrestricted local paths | Semicolon-separated existing roots for capture/CSV/PNG outputs |
+| `PIX_MCP_EXECUTABLE_ROOTS` | unrestricted local paths | Semicolon-separated existing roots for target executables and working directories |
+| `PIX_MCP_ALLOW_UNC_PATHS` | `false` | Allow UNC paths; Windows device/verbatim namespaces remain forbidden |
+| `PIX_MCP_ALLOW_ELEVATED_LAUNCH` | `false` | Allow user-controlled application launch while elevated |
+| `PIX_MCP_MAX_CONCURRENT_TOOLS` | `8` | Global MCP tool-call limit (`1..=64`) |
+
+Setting `PIX_MCP_INPUT_ROOTS` or `PIX_MCP_OUTPUT_ROOTS` also implicitly includes the captures
+directory. Set either variable to an empty string to allow only the captures directory for that
+class. Relative artifact paths are resolved from the captures directory; relative executable and
+working-directory paths use the process directory. Roots and existing paths are canonicalized; reparse-point targets must remain within an
+allowed root. UNC paths require explicit opt-in, while device namespaces, alternate data streams,
+reserved device names, and ambiguous Windows paths are always rejected.
+
+Example hardened configuration:
+
+```powershell
+$env:PIX_MCP_CAPTURES_DIR = 'D:\PIX\Captures'
+$env:PIX_MCP_INPUT_ROOTS = 'D:\PIX\Captures;D:\PIX\CounterExports'
+$env:PIX_MCP_OUTPUT_ROOTS = ''
+$env:PIX_MCP_EXECUTABLE_ROOTS = 'D:\Games\TrustedBuilds'
+cargo run --locked --release
+```
 
 ## Development checks
 
@@ -98,6 +129,7 @@ If needed, install the audit command with `cargo install cargo-audit --locked`.
 ```
 src/
 ├── main.rs            # entry point: starts the rmcp stdio server
+├── security.rs        # path, privilege, diagnostic, and concurrency policy
 ├── pix/
 │   ├── mod.rs
 │   └── pixtool.rs     # pixtool.exe discovery + subprocess wrapper

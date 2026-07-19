@@ -10,6 +10,7 @@ use tokio::process::Command;
 
 use crate::pix::PixTool;
 use crate::pix::pixtool::{PROCESS_OUTPUT_DIAGNOSTIC_PREFIX, run_pixtool_command};
+use crate::security;
 
 const PIXTOOL_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -36,6 +37,10 @@ pub struct StatusReport {
     pub pixtool: PixComponent,
     /// Whether the process is running elevated (required for timing captures).
     pub is_admin: bool,
+    /// Whether user-controlled application launches are allowed while elevated.
+    pub elevated_launch_allowed: bool,
+    /// Default directory used by capture listing and MCP resources.
+    pub captures_directory: String,
     /// Note about the current privilege level.
     pub privileges_note: String,
     /// Actionable suggestions to fix any problems.
@@ -64,7 +69,11 @@ pub async fn handle_pix_status() -> Result<StatusReport> {
         },
     };
 
-    let is_admin = is_elevated();
+    let is_admin = security::is_elevated()?;
+    let elevated_launch_allowed = security::elevated_launch_allowed()?;
+    let captures_directory = security::capture_directory()?
+        .to_string_lossy()
+        .into_owned();
     let ready = pixtool.found && pixtool.error.is_none();
 
     let mut suggestions = Vec::new();
@@ -83,6 +92,11 @@ pub async fn handle_pix_status() -> Result<StatusReport> {
     }
     if !is_admin {
         suggestions.push("Run as administrator to enable timing captures".to_string());
+    } else if !elevated_launch_allowed {
+        suggestions.push(
+            "Use a separate non-elevated server for application-launch tools; timing capture remains enabled here"
+                .to_string(),
+        );
     }
     if suggestions.is_empty() {
         suggestions.push("All systems operational".to_string());
@@ -98,8 +112,16 @@ pub async fn handle_pix_status() -> Result<StatusReport> {
         ready,
         pixtool,
         is_admin,
+        elevated_launch_allowed,
+        captures_directory,
         privileges_note: if is_admin {
-            "Full access including timing captures".to_string()
+            if elevated_launch_allowed {
+                "Timing captures and explicitly opted-in elevated application launches are enabled"
+                    .to_string()
+            } else {
+                "Timing captures are enabled; application-launch tools are blocked while elevated"
+                    .to_string()
+            }
         } else {
             "GPU captures work; timing captures require admin".to_string()
         },
@@ -130,44 +152,4 @@ async fn probe_pixtool(path: &Path) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-/// Check if the current process is running with elevated privileges.
-fn is_elevated() -> bool {
-    #[cfg(windows)]
-    {
-        use std::mem;
-        use windows::Win32::Foundation::{CloseHandle, HANDLE};
-        use windows::Win32::Security::{
-            GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
-        };
-        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-        unsafe {
-            let mut token_handle: HANDLE = HANDLE::default();
-            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token_handle).is_err() {
-                return false;
-            }
-
-            let mut elevation: TOKEN_ELEVATION = mem::zeroed();
-            let mut size = mem::size_of::<TOKEN_ELEVATION>() as u32;
-
-            let result = GetTokenInformation(
-                token_handle,
-                TokenElevation,
-                Some(&mut elevation as *mut _ as *mut _),
-                size,
-                &mut size,
-            );
-
-            let _ = CloseHandle(token_handle);
-
-            result.is_ok() && elevation.TokenIsElevated != 0
-        }
-    }
-
-    #[cfg(not(windows))]
-    {
-        false
-    }
 }

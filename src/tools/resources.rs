@@ -95,16 +95,9 @@ fn read_capture_resource_text_sync(uri: &str, captures_dir: Option<&Path>) -> Re
 
     let dir = match captures_dir {
         Some(dir) => dir.to_path_buf(),
-        None => std::env::current_dir().context("Could not determine the current directory")?,
+        None => crate::security::capture_directory()?,
     };
-    let dir = std::fs::canonicalize(&dir)
-        .with_context(|| format!("Capture directory does not exist: {}", dir.display()))?;
-    if !dir.is_dir() {
-        return Err(anyhow::anyhow!(
-            "Capture directory is not a directory: {}",
-            dir.display()
-        ));
-    }
+    let dir = crate::security::validate_input_directory(&dir, "Capture directory")?;
 
     let payload = match resource {
         CaptureResource::List => {

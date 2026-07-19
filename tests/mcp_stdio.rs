@@ -15,8 +15,27 @@ struct McpSession {
 
 impl McpSession {
     fn spawn() -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_pix-mcp"))
-            .env("RUST_LOG", "error")
+        Self::spawn_with_env(&[])
+    }
+
+    fn spawn_with_env(environment: &[(&str, &str)]) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pix-mcp"));
+        command.env("RUST_LOG", "error");
+        for name in [
+            "PIX_MCP_CAPTURES_DIR",
+            "PIX_MCP_INPUT_ROOTS",
+            "PIX_MCP_OUTPUT_ROOTS",
+            "PIX_MCP_EXECUTABLE_ROOTS",
+            "PIX_MCP_ALLOW_UNC_PATHS",
+            "PIX_MCP_ALLOW_ELEVATED_LAUNCH",
+            "PIX_MCP_MAX_CONCURRENT_TOOLS",
+        ] {
+            command.env_remove(name);
+        }
+        for (name, value) in environment {
+            command.env(name, value);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -75,6 +94,26 @@ impl McpSession {
     }
 }
 
+fn initialize(session: &mut McpSession) {
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "pix-mcp-integration-test", "version": "1" }
+        }
+    }));
+    let response = session.receive_until(|message| message["id"] == json!(1));
+    assert!(response.get("error").is_none(), "{response}");
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+        "params": {}
+    }));
+}
+
 impl Drop for McpSession {
     fn drop(&mut self) {
         self.stdin.take();
@@ -105,6 +144,38 @@ fn stdio_task_fallback_and_elicitation_cancellation_are_protocol_compliant() {
         "method": "notifications/initialized",
         "params": {}
     }));
+
+    session.send(json!({ "jsonrpc": "2.0", "id": 6, "method": "tools/list", "params": {} }));
+    let tools = session.receive_until(|message| message["id"] == json!(6));
+    let listed_tools = tools["result"]["tools"].as_array().expect("tool list");
+    assert!(!listed_tools.is_empty());
+    for tool in listed_tools {
+        assert_eq!(
+            tool["inputSchema"]["additionalProperties"],
+            json!(false),
+            "tool schema must be closed: {tool}"
+        );
+    }
+
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/call",
+        "params": {
+            "name": "pix_list_captures",
+            "arguments": { "unexpected": true }
+        }
+    }));
+    let strict_input = session.receive_until(|message| message["id"] == json!(7));
+    let strict_text = strict_input.to_string().to_ascii_lowercase();
+    assert!(
+        strict_input.get("error").is_some() || strict_input["result"]["isError"] == json!(true),
+        "unknown input unexpectedly succeeded: {strict_input}"
+    );
+    assert!(
+        strict_text.contains("unknown field") || strict_text.contains("invalid"),
+        "unknown-field error was not actionable: {strict_input}"
+    );
 
     // MCP requires task metadata to be ignored when the server does not
     // advertise task execution. rmcp 2.2 otherwise rejects this request.
@@ -175,4 +246,73 @@ fn stdio_task_fallback_and_elicitation_cancellation_are_protocol_compliant() {
         message["id"] == json!(5)
     });
     assert!(ping.get("error").is_none(), "{ping}");
+}
+
+#[test]
+fn stdio_security_policy_uses_capture_directory_and_enforces_roots() {
+    let captures = tempfile::tempdir().expect("captures directory");
+    let outside = tempfile::tempdir().expect("outside directory");
+    std::fs::write(captures.path().join("allowed.wpix"), b"capture").expect("capture fixture");
+    let outside_csv = outside.path().join("outside.csv");
+    std::fs::write(&outside_csv, b"Counter,Value\nGPU,1\n").expect("counter fixture");
+
+    let captures_text = captures.path().to_string_lossy().into_owned();
+    let mut session = McpSession::spawn_with_env(&[
+        ("PIX_MCP_CAPTURES_DIR", &captures_text),
+        ("PIX_MCP_INPUT_ROOTS", ""),
+        ("PIX_MCP_OUTPUT_ROOTS", ""),
+    ]);
+    initialize(&mut session);
+
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": { "name": "pix_list_captures", "arguments": {} }
+    }));
+    let listed = session.receive_until(|message| message["id"] == json!(2));
+    assert_eq!(listed["result"]["structuredContent"]["total_count"], 1);
+    assert_eq!(
+        listed["result"]["structuredContent"]["captures"][0]["name"],
+        "allowed.wpix"
+    );
+
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "pix_export_counters",
+            "arguments": { "file_path": outside_csv.to_string_lossy() }
+        }
+    }));
+    let denied_input = session.receive_until(|message| message["id"] == json!(3));
+    assert_eq!(denied_input["result"]["isError"], true, "{denied_input}");
+    assert!(
+        denied_input
+            .to_string()
+            .contains("outside the configured allowlist"),
+        "{denied_input}"
+    );
+
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": {
+            "name": "pix_gpu_capture",
+            "arguments": {
+                "process_id": 1,
+                "output_path": outside.path().join("denied.wpix").to_string_lossy()
+            }
+        }
+    }));
+    let denied_output = session.receive_until(|message| message["id"] == json!(4));
+    assert_eq!(denied_output["result"]["isError"], true, "{denied_output}");
+    assert!(
+        denied_output
+            .to_string()
+            .contains("outside the configured allowlist"),
+        "{denied_output}"
+    );
 }

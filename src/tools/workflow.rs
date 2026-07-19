@@ -10,6 +10,7 @@ use super::analysis::{FrameInsights, analyze_frame_insights};
 use crate::pix::PixTool;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CaptureAndAnalyzeArgs {
     /// Path to the executable to launch and capture.
     pub exe_path: String,
@@ -106,7 +107,10 @@ pub async fn handle_pix_capture_and_analyze(
         {
             Ok(res) => Some(res.report.output_path),
             Err(e) => {
-                tracing::warn!("screenshot during capture_and_analyze failed: {}", e);
+                tracing::warn!(
+                    "screenshot during capture_and_analyze failed: {}",
+                    crate::security::sanitize_process_output(&e.to_string())
+                );
                 warnings.push(format!(
                     "Screenshot extraction failed after the capture was saved: {e}"
                 ));

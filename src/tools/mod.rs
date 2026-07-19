@@ -7,6 +7,8 @@ mod resources;
 mod status;
 mod workflow;
 
+use std::sync::Arc;
+
 use anyhow::Result as AnyResult;
 use rmcp::{
     ErrorData as McpError, Json, RoleServer, ServerHandler, elicit_safe,
@@ -17,6 +19,15 @@ use rmcp::{
     tool, tool_router,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+const TOOL_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+enum ToolPermitError {
+    Busy,
+    Cancelled,
+    Closed,
+}
 
 /// The PIX MCP server. Tools are registered through the `#[tool_router]` macro.
 #[derive(Clone)]
@@ -30,6 +41,7 @@ pub struct PixServer {
 #[derive(Clone)]
 pub struct PixService {
     server: PixServer,
+    tool_concurrency: Arc<Semaphore>,
 }
 
 impl Default for PixServer {
@@ -40,6 +52,7 @@ impl Default for PixServer {
 
 /// Elicitation payload used to ask the client for a missing output path.
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Destination file path")]
 struct OutputPathRequest {
     /// Path for the output file (absolute paths are recommended).
@@ -47,6 +60,11 @@ struct OutputPathRequest {
     output_path: String,
 }
 elicit_safe!(OutputPathRequest);
+
+/// Closed schema for tools that intentionally accept no arguments.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct EmptyArgs {}
 
 /// Wrap a logic-handler result for an MCP tool. Success becomes a typed
 /// `Json<T>` value (producing an `outputSchema` and `structuredContent` plus a
@@ -183,6 +201,64 @@ async fn resolve_output_path(
     }
 }
 
+fn output_path_elicitation(name: &str) -> Option<(&'static str, &'static str)> {
+    match name {
+        "pix_gpu_capture" => Some((
+            "process_id",
+            "Where should the GPU capture (.wpix) be saved?",
+        )),
+        "pix_gpu_capture_launch" => {
+            Some(("exe_path", "Where should the GPU capture (.wpix) be saved?"))
+        }
+        "pix_timing_capture" => Some((
+            "process_id",
+            "Where should the timing capture (.wpix) be saved?",
+        )),
+        "pix_get_screenshot" => Some(("capture_path", "Where should the screenshot PNG be saved?")),
+        "pix_capture_and_analyze" => {
+            Some(("exe_path", "Where should the capture (.wpix) be saved?"))
+        }
+        _ => None,
+    }
+}
+
+/// Resolve missing destinations before acquiring an execution slot. This
+/// prevents several unanswered forms from exhausting the global tool pool.
+/// Calls with malformed/missing required arguments are left to the normal
+/// schema validator and therefore never trigger an unnecessary form.
+async fn preflight_output_path(
+    context: &RequestContext<RoleServer>,
+    request: &mut CallToolRequestParams,
+) -> Result<(), String> {
+    let Some((required_argument, prompt)) = output_path_elicitation(&request.name) else {
+        return Ok(());
+    };
+    let Some(arguments) = request.arguments.as_mut() else {
+        return Ok(());
+    };
+    let has_required_argument = arguments
+        .get(required_argument)
+        .is_some_and(|value| match value {
+            serde_json::Value::String(value) => !value.trim().is_empty(),
+            serde_json::Value::Number(_) => true,
+            _ => false,
+        });
+    if !has_required_argument
+        || arguments
+            .get("output_path")
+            .is_some_and(|value| !value.is_null())
+    {
+        return Ok(());
+    }
+
+    let output_path = resolve_output_path(context, None, prompt).await?;
+    arguments.insert(
+        "output_path".to_string(),
+        serde_json::Value::String(output_path),
+    );
+    Ok(())
+}
+
 #[tool_router(router = tool_router)]
 impl PixServer {
     pub fn new() -> Self {
@@ -197,7 +273,10 @@ impl PixServer {
                        whether the server is running elevated (required for timing captures).",
         annotations(title = "PIX status", read_only_hint = true)
     )]
-    async fn pix_status(&self) -> Result<Json<status::StatusReport>, String> {
+    async fn pix_status(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<Json<status::StatusReport>, String> {
         done(status::handle_pix_status().await)
     }
 
@@ -614,6 +693,33 @@ impl rmcp::Service<RoleServer> for PixService {
                 // receiver to ignore task metadata and process the call
                 // normally in that case.
                 request.params.task = None;
+
+                if let Err(error) = preflight_output_path(&context, &mut request.params).await {
+                    return Ok(ServerResult::CallToolResult(CallToolResult::error(vec![
+                        ContentBlock::text(error),
+                    ])));
+                }
+
+                let _permit =
+                    match acquire_tool_permit(self.tool_concurrency.clone(), &context).await {
+                        Ok(permit) => permit,
+                        Err(ToolPermitError::Busy) => {
+                            return Ok(ServerResult::CallToolResult(CallToolResult::error(vec![
+                                ContentBlock::text(
+                                    "Server is busy: timed out waiting for a tool execution slot",
+                                ),
+                            ])));
+                        }
+                        Err(ToolPermitError::Cancelled) => {
+                            return Err(McpError::internal_error("Tool request cancelled", None));
+                        }
+                        Err(ToolPermitError::Closed) => {
+                            return Err(McpError::internal_error(
+                                "Tool concurrency limiter is unavailable",
+                                None,
+                            ));
+                        }
+                    };
                 self.server
                     .call_tool(request.params, context)
                     .await
@@ -648,11 +754,29 @@ impl rmcp::Service<RoleServer> for PixService {
     }
 }
 
-/// Build a new PIX MCP server instance.
-pub fn create_server() -> PixService {
-    PixService {
-        server: PixServer::new(),
+async fn acquire_tool_permit(
+    semaphore: Arc<Semaphore>,
+    context: &RequestContext<RoleServer>,
+) -> Result<OwnedSemaphorePermit, ToolPermitError> {
+    let acquire = semaphore.acquire_owned();
+    tokio::pin!(acquire);
+    let timeout = tokio::time::sleep(TOOL_QUEUE_TIMEOUT);
+    tokio::pin!(timeout);
+
+    tokio::select! {
+        biased;
+        _ = context.ct.cancelled() => Err(ToolPermitError::Cancelled),
+        permit = &mut acquire => permit.map_err(|_| ToolPermitError::Closed),
+        _ = &mut timeout => Err(ToolPermitError::Busy),
     }
+}
+
+/// Build a new PIX MCP server instance.
+pub fn create_server() -> AnyResult<PixService> {
+    Ok(PixService {
+        server: PixServer::new(),
+        tool_concurrency: Arc::new(Semaphore::new(crate::security::max_concurrent_tools()?)),
+    })
 }
 
 #[cfg(test)]
@@ -669,6 +793,19 @@ mod tests {
             assert!(
                 tool.output_schema.is_some(),
                 "tool {} is missing outputSchema",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_tool_rejects_unknown_input_fields_in_its_schema() {
+        let server = PixServer::new();
+        for tool in server.tool_router.list_all() {
+            assert_eq!(
+                tool.input_schema.get("additionalProperties"),
+                Some(&serde_json::Value::Bool(false)),
+                "tool {} must advertise additionalProperties=false",
                 tool.name
             );
         }

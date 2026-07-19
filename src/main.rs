@@ -3,6 +3,7 @@
 //! This server exposes PIX GPU capture and debugging tools to AI agents via MCP.
 
 mod pix;
+mod security;
 mod tools;
 
 use anyhow::Result;
@@ -23,8 +24,12 @@ async fn main() -> Result<()> {
 
     tracing::info!("Starting PIX MCP Server v{}", env!("CARGO_PKG_VERSION"));
 
+    // Fail closed on malformed path/privilege policy rather than discovering
+    // it only after a client starts issuing tool calls.
+    security::initialize()?;
+
     // Serve the MCP protocol over stdio using the official rmcp SDK.
-    let service = tools::create_server()
+    let service = tools::create_server()?
         .serve(stdio())
         .await
         .inspect_err(|e| {
