@@ -49,6 +49,9 @@ npx @modelcontextprotocol/inspector cargo run --locked --release
   duration plus 30 seconds. Timed-out processes and cancelled foreground processes are terminated.
 - MCP Tasks are not advertised; calls use normal request cancellation and the bounded timeouts
   above. `pix_open_capture` launches the WinPix GUI intentionally outside the managed pools.
+- Long calls with `_meta.progressToken` receive monotonic, rate-limited progress notifications;
+  optional notification failures never fail the PIX operation. Written `.wpix`, PNG, and CSV
+  artifacts are also returned as annotated MCP resource links.
 - Capture analysis requires Windows Developer Mode for `save-event-list`, `save-screenshot`,
   `save-resource`, `list-counters`, and `run-debug-layer`. Timing captures require elevation;
   ordinary GPU capture does not.

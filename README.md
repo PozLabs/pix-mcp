@@ -108,8 +108,14 @@ Add to `claude_desktop_config.json`:
   `pixtool` process trees, and cleans up staged artifacts.
 - **Direct calls** — MCP Tasks are not advertised; long-running calls use normal request
   cancellation and the server's bounded execution timeouts.
+- **Progress notifications** — long PIX capture/replay/export operations emit monotonic,
+  rate-limited `notifications/progress` updates when the request supplies a `progressToken`.
+  Delivery failures never fail the underlying operation.
 - **Structured output** — every tool advertises a JSON `outputSchema` and returns `structuredContent`.
 - **Image content** — `pix_get_screenshot` returns the rendered frame as an inline image.
+- **Artifact links** — newly written `.wpix`, PNG, and CSV outputs are returned as annotated,
+  session-local `artifact://` resource links. Small text/images are directly readable; large or
+  binary captures resolve to bounded JSON descriptors.
 - **Elicitation** — when a tool requires a destination, a missing `output_path` is requested
   interactively if the client supports elicitation; otherwise a clear, model-correctable tool
   error is returned. (`pix_get_event_list` can omit it to receive inline rows.)
@@ -180,6 +186,12 @@ by PID, but refuses user-controlled application launches unless the operator exp
 
 ## MCP Resources
 
+`resources/list` is a paginated, deterministically ordered catalog containing `capture://list`
+and the concrete captures in `PIX_MCP_CAPTURES_DIR`. Entries include `size`, assistant audience,
+priority, and last-modified annotations. Cursors are tied to a catalog generation and expire
+cleanly when files change. Filesystem watching is not enabled, so the server deliberately does not
+advertise `resources.listChanged`.
+
 | Resource URI | Description |
 |--------------|-------------|
 | `capture://list` | List up to 500 captures in `PIX_MCP_CAPTURES_DIR` (or the server working directory when unset); `directory`, `total_count`, and `truncated` are returned |
@@ -187,6 +199,7 @@ by PID, but refuses user-controlled application launches unless the operator exp
 | `capture://{id}/metadata` | Get file metadata for a capture |
 | `capture://{id}/events` | Hint to use the `pix_get_event_list` tool |
 | `capture://{id}/counters` | Hint to use the `pix_list_counters` tool |
+| `artifact://local/{id}` | Session-local output returned by a successful tool; small artifacts are readable and large/binary artifacts return bounded descriptors |
 
 ## Example Workflow
 

@@ -7,11 +7,17 @@ mod resources;
 mod status;
 mod workflow;
 
-use std::sync::Arc;
+use std::{
+    collections::hash_map::DefaultHasher,
+    future::Future,
+    hash::{Hash, Hasher},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Result as AnyResult;
 use rmcp::{
-    ErrorData as McpError, Json, RoleServer, ServerHandler, elicit_safe,
+    ErrorData as McpError, Json, Peer, RoleServer, ServerHandler, elicit_safe,
     handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
     model::*,
     schemars,
@@ -29,10 +35,16 @@ enum ToolPermitError {
     Closed,
 }
 
+const PROGRESS_NOTIFICATION_INTERVAL: Duration = Duration::from_secs(1);
+const PROGRESS_NOTIFICATION_TIMEOUT: Duration = Duration::from_millis(250);
+const RESOURCE_PAGE_SIZE: usize = 100;
+const RESOURCE_CURSOR_PREFIX: &str = "pix-captures-v2:";
+
 /// The PIX MCP server. Tools are registered through the `#[tool_router]` macro.
 #[derive(Clone)]
 pub struct PixServer {
     tool_router: ToolRouter<Self>,
+    artifact_registry: resources::ArtifactRegistry,
 }
 
 /// Service wrapper that normalizes task-augmented tool calls to direct calls.
@@ -74,10 +86,248 @@ fn done<T>(result: AnyResult<T>) -> Result<Json<T>, String> {
     result.map(Json).map_err(|e| e.to_string())
 }
 
+#[derive(Debug)]
+struct ProgressGate {
+    last_progress: f64,
+    last_sent: Option<tokio::time::Instant>,
+}
+
+impl Default for ProgressGate {
+    fn default() -> Self {
+        Self {
+            last_progress: -1.0,
+            last_sent: None,
+        }
+    }
+}
+
+impl ProgressGate {
+    fn admit(&mut self, progress: f64, now: tokio::time::Instant, force: bool) -> bool {
+        if !progress.is_finite() || progress <= self.last_progress {
+            return false;
+        }
+        if !force
+            && self.last_sent.is_some_and(|last| {
+                now.saturating_duration_since(last) < PROGRESS_NOTIFICATION_INTERVAL
+            })
+        {
+            return false;
+        }
+        self.last_progress = progress;
+        self.last_sent = Some(now);
+        true
+    }
+}
+
+struct ProgressReporter {
+    peer: Peer<RoleServer>,
+    token: ProgressToken,
+    progress: f64,
+    gate: ProgressGate,
+}
+
+impl ProgressReporter {
+    fn from_context(context: &RequestContext<RoleServer>) -> Option<Self> {
+        Some(Self {
+            peer: context.peer.clone(),
+            token: context.meta.get_progress_token()?,
+            progress: 0.0,
+            gate: ProgressGate::default(),
+        })
+    }
+
+    async fn send(&mut self, message: impl Into<String>, force: bool) {
+        let progress = self.progress;
+        if !self
+            .gate
+            .admit(progress, tokio::time::Instant::now(), force)
+        {
+            return;
+        }
+        let notification = ProgressNotificationParam::new(self.token.clone(), progress)
+            .with_message(message.into());
+        match tokio::time::timeout(
+            PROGRESS_NOTIFICATION_TIMEOUT,
+            self.peer.notify_progress(notification),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::debug!(%error, "Could not deliver optional progress notification");
+            }
+            Err(_) => {
+                tracing::debug!("Optional progress notification timed out");
+            }
+        }
+    }
+
+    async fn advance(&mut self, message: impl Into<String>, force: bool) {
+        self.progress += 1.0;
+        self.send(message, force).await;
+    }
+}
+
+/// Run a potentially slow operation while emitting optional, monotonically
+/// increasing progress. No total is claimed because PIX subprocess duration
+/// is generally unknowable. Notification transport failures are deliberately
+/// non-fatal to the underlying tool operation.
+async fn with_progress<T>(
+    context: &RequestContext<RoleServer>,
+    operation: &'static str,
+    future: impl Future<Output = T>,
+) -> T {
+    let Some(mut reporter) = ProgressReporter::from_context(context) else {
+        return future.await;
+    };
+
+    reporter.send(format!("{operation} started"), true).await;
+    tokio::pin!(future);
+    let mut interval = tokio::time::interval(PROGRESS_NOTIFICATION_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+
+    loop {
+        tokio::select! {
+            result = &mut future => {
+                reporter.advance(format!("{operation} finished"), true).await;
+                return result;
+            }
+            _ = interval.tick() => {
+                reporter.advance(format!("{operation} is still running"), false).await;
+            }
+        }
+    }
+}
+
+fn structured_call_result<T: Serialize>(
+    result: AnyResult<T>,
+    resources: impl FnOnce(&T) -> Vec<Resource>,
+) -> Result<CallToolResult, McpError> {
+    match result {
+        Ok(report) => {
+            let structured_content = serde_json::to_value(&report).map_err(|error| {
+                McpError::internal_error(format!("Failed to serialize tool result: {error}"), None)
+            })?;
+            let mut call_result = CallToolResult::structured(structured_content);
+            call_result.content.extend(
+                resources(&report)
+                    .into_iter()
+                    .map(ContentBlock::resource_link),
+            );
+            Ok(call_result)
+        }
+        Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(
+            error.to_string(),
+        )])),
+    }
+}
+
+fn reject_cursor(request: Option<&PaginatedRequestParams>, endpoint: &str) -> Result<(), McpError> {
+    if request.and_then(|params| params.cursor.as_ref()).is_some() {
+        Err(McpError::invalid_params(
+            format!("{endpoint} does not paginate; cursor must be omitted"),
+            None,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn map_resource_error(error: resources::ResourceReadError, uri: &str) -> McpError {
+    match error {
+        resources::ResourceReadError::InvalidRequest(message) => {
+            McpError::invalid_params(message, Some(serde_json::json!({ "uri": uri })))
+        }
+        resources::ResourceReadError::NotFound(message) => {
+            McpError::resource_not_found(message, Some(serde_json::json!({ "uri": uri })))
+        }
+        resources::ResourceReadError::Internal(error) => {
+            tracing::error!(%error, %uri, "Failed to read PIX resource");
+            McpError::internal_error(
+                "Failed to read PIX resource",
+                Some(serde_json::json!({ "uri": uri })),
+            )
+        }
+    }
+}
+
+fn resource_catalog_generation(resources: &[Resource]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for resource in resources {
+        resource.uri.hash(&mut hasher);
+        resource.name.hash(&mut hasher);
+        resource.size.hash(&mut hasher);
+        resource
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.last_modified.as_ref())
+            .map(ToString::to_string)
+            .hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn resource_cursor_offset(
+    request: Option<&PaginatedRequestParams>,
+    generation: u64,
+    total: usize,
+) -> Result<usize, McpError> {
+    let Some(cursor) = request.and_then(|params| params.cursor.as_deref()) else {
+        return Ok(0);
+    };
+    let Some(payload) = cursor.strip_prefix(RESOURCE_CURSOR_PREFIX) else {
+        return Err(McpError::invalid_params(
+            "Unrecognized resources/list cursor",
+            Some(serde_json::json!({ "cursor": cursor })),
+        ));
+    };
+    let Some((cursor_generation, offset)) = payload.split_once(':') else {
+        return Err(McpError::invalid_params(
+            "Malformed resources/list cursor",
+            Some(serde_json::json!({ "cursor": cursor })),
+        ));
+    };
+    if offset.contains(':') {
+        return Err(McpError::invalid_params(
+            "Malformed resources/list cursor",
+            Some(serde_json::json!({ "cursor": cursor })),
+        ));
+    }
+    let cursor_generation = u64::from_str_radix(cursor_generation, 16).map_err(|_| {
+        McpError::invalid_params(
+            "Malformed resources/list cursor",
+            Some(serde_json::json!({ "cursor": cursor })),
+        )
+    })?;
+    let offset = offset.parse::<usize>().map_err(|_| {
+        McpError::invalid_params(
+            "Malformed resources/list cursor",
+            Some(serde_json::json!({ "cursor": cursor })),
+        )
+    })?;
+    if cursor_generation != generation {
+        return Err(McpError::invalid_params(
+            "resources/list cursor expired because the capture catalog changed",
+            Some(serde_json::json!({ "cursor": cursor })),
+        ));
+    }
+    if offset == 0 || offset % RESOURCE_PAGE_SIZE != 0 || offset >= total {
+        return Err(McpError::invalid_params(
+            "resources/list cursor was not emitted for this catalog",
+            Some(serde_json::json!({ "cursor": cursor })),
+        ));
+    }
+    Ok(offset)
+}
+
 /// Build the mixed image/structured response used by `pix_get_screenshot`.
 /// The JSON text mirrors `structuredContent` for clients that only consume
 /// content blocks.
-fn screenshot_call_result(res: analysis::ScreenshotResult) -> Result<CallToolResult, McpError> {
+fn screenshot_call_result(
+    registry: &resources::ArtifactRegistry,
+    res: analysis::ScreenshotResult,
+) -> Result<CallToolResult, McpError> {
     let structured_content = serde_json::to_value(&res.report).map_err(|e| {
         McpError::internal_error(format!("Failed to serialize screenshot report: {e}"), None)
     })?;
@@ -87,6 +337,14 @@ fn screenshot_call_result(res: analysis::ScreenshotResult) -> Result<CallToolRes
         result
             .content
             .insert(0, ContentBlock::image(b64, "image/png"));
+    }
+    if let Some(resource) = resources::local_artifact_resource(
+        registry,
+        &res.report.output_path,
+        "PIX screenshot",
+        "image/png",
+    ) {
+        result.content.push(ContentBlock::resource_link(resource));
     }
     Ok(result)
 }
@@ -264,6 +522,7 @@ impl PixServer {
     pub fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
+            artifact_registry: resources::ArtifactRegistry::default(),
         }
     }
 
@@ -290,22 +549,56 @@ impl PixServer {
     )]
     async fn pix_launch(
         &self,
+        context: RequestContext<RoleServer>,
         Parameters(args): Parameters<launch::LaunchArgs>,
     ) -> Result<Json<launch::LaunchReport>, String> {
-        done(launch::handle_pix_launch(args).await)
+        done(
+            with_progress(
+                &context,
+                "Launching application with PIX",
+                launch::handle_pix_launch(args),
+            )
+            .await,
+        )
     }
 
     #[tool(
         name = "pix_launch_and_capture",
         description = "Launch an executable with PIX and capture from start. Useful for \
                        capturing startup behavior or the first frames of an application.",
-        annotations(title = "Launch and capture", destructive_hint = true)
+        annotations(title = "Launch and capture", destructive_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<launch::LaunchReport>()
+            .expect("LaunchReport must produce a valid object output schema"),
     )]
     async fn pix_launch_and_capture(
         &self,
+        context: RequestContext<RoleServer>,
         Parameters(args): Parameters<launch::LaunchAndCaptureArgs>,
-    ) -> Result<Json<launch::LaunchReport>, String> {
-        done(launch::handle_pix_launch_and_capture(args).await)
+    ) -> Result<CallToolResult, McpError> {
+        let capture_path = args
+            .capture_file
+            .as_deref()
+            .and_then(|path| capture::normalize_wpix_output(path, "capture_file").ok());
+        let result = with_progress(
+            &context,
+            "Launching application and capturing",
+            launch::handle_pix_launch_and_capture(args),
+        )
+        .await;
+        structured_call_result(result, |_| {
+            capture_path
+                .as_deref()
+                .and_then(|path| {
+                    resources::local_artifact_resource(
+                        &self.artifact_registry,
+                        path,
+                        "PIX startup capture",
+                        "application/octet-stream",
+                    )
+                })
+                .into_iter()
+                .collect()
+        })
     }
 
     #[tool(
@@ -314,65 +607,134 @@ impl PixServer {
                        .wpix file. IMPORTANT: PIX can only GPU-capture a process it launched \
                        itself; attaching to an independently-started game fails with PIXTOOL17. \
                        For a normal game, prefer pix_gpu_capture_launch or pix_capture_and_analyze.",
-        annotations(title = "GPU capture (PID)", destructive_hint = true)
+        annotations(title = "GPU capture (PID)", destructive_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<capture::CaptureReport>()
+            .expect("CaptureReport must produce a valid object output schema"),
     )]
     async fn pix_gpu_capture(
         &self,
         context: RequestContext<RoleServer>,
         Parameters(mut args): Parameters<capture::GpuCaptureArgs>,
-    ) -> Result<Json<capture::CaptureReport>, String> {
+    ) -> Result<CallToolResult, McpError> {
         args.output_path = Some(
-            resolve_output_path(
+            match resolve_output_path(
                 &context,
                 args.output_path,
                 "Where should the GPU capture (.wpix) be saved?",
             )
-            .await?,
+            .await
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(error)]));
+                }
+            },
         );
-        done(capture::handle_pix_gpu_capture(args).await)
+        let result = with_progress(
+            &context,
+            "Taking GPU capture",
+            capture::handle_pix_gpu_capture(args),
+        )
+        .await;
+        structured_call_result(result, |report| {
+            resources::local_artifact_resource(
+                &self.artifact_registry,
+                &report.output_path,
+                "PIX GPU capture",
+                "application/octet-stream",
+            )
+            .into_iter()
+            .collect()
+        })
     }
 
     #[tool(
         name = "pix_gpu_capture_launch",
         description = "Launch an executable and capture GPU frames to a .wpix file via pixtool.exe.",
-        annotations(title = "Launch + GPU capture", destructive_hint = true)
+        annotations(title = "Launch + GPU capture", destructive_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<capture::CaptureReport>()
+            .expect("CaptureReport must produce a valid object output schema"),
     )]
     async fn pix_gpu_capture_launch(
         &self,
         context: RequestContext<RoleServer>,
         Parameters(mut args): Parameters<capture::GpuCaptureLaunchArgs>,
-    ) -> Result<Json<capture::CaptureReport>, String> {
+    ) -> Result<CallToolResult, McpError> {
         args.output_path = Some(
-            resolve_output_path(
+            match resolve_output_path(
                 &context,
                 args.output_path,
                 "Where should the GPU capture (.wpix) be saved?",
             )
-            .await?,
+            .await
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(error)]));
+                }
+            },
         );
-        done(capture::handle_pix_gpu_capture_launch(args).await)
+        let result = with_progress(
+            &context,
+            "Launching application and taking GPU capture",
+            capture::handle_pix_gpu_capture_launch(args),
+        )
+        .await;
+        structured_call_result(result, |report| {
+            resources::local_artifact_resource(
+                &self.artifact_registry,
+                &report.output_path,
+                "PIX GPU capture",
+                "application/octet-stream",
+            )
+            .into_iter()
+            .collect()
+        })
     }
 
     #[tool(
         name = "pix_timing_capture",
         description = "Take a timing capture of a running process (CPU/GPU timing). Requires \
                        administrator privileges.",
-        annotations(title = "Timing capture (PID)", destructive_hint = true)
+        annotations(title = "Timing capture (PID)", destructive_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<capture::CaptureReport>()
+            .expect("CaptureReport must produce a valid object output schema"),
     )]
     async fn pix_timing_capture(
         &self,
         context: RequestContext<RoleServer>,
         Parameters(mut args): Parameters<capture::TimingCaptureArgs>,
-    ) -> Result<Json<capture::CaptureReport>, String> {
+    ) -> Result<CallToolResult, McpError> {
         args.output_path = Some(
-            resolve_output_path(
+            match resolve_output_path(
                 &context,
                 args.output_path,
                 "Where should the timing capture (.wpix) be saved?",
             )
-            .await?,
+            .await
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(error)]));
+                }
+            },
         );
-        done(capture::handle_pix_timing_capture(args).await)
+        let result = with_progress(
+            &context,
+            "Taking PIX timing capture",
+            capture::handle_pix_timing_capture(args),
+        )
+        .await;
+        structured_call_result(result, |report| {
+            resources::local_artifact_resource(
+                &self.artifact_registry,
+                &report.output_path,
+                "PIX timing capture",
+                "application/octet-stream",
+            )
+            .into_iter()
+            .collect()
+        })
     }
 
     #[tool(
@@ -382,9 +744,17 @@ impl PixServer {
     )]
     async fn pix_list_captures(
         &self,
+        context: RequestContext<RoleServer>,
         Parameters(args): Parameters<capture::ListCapturesArgs>,
     ) -> Result<Json<capture::CaptureListReport>, String> {
-        done(capture::handle_pix_list_captures(args).await)
+        done(
+            with_progress(
+                &context,
+                "Scanning PIX captures",
+                capture::handle_pix_list_captures(args),
+            )
+            .await,
+        )
     }
 
     #[tool(
@@ -407,9 +777,17 @@ impl PixServer {
     )]
     async fn pix_analyze_capture(
         &self,
+        context: RequestContext<RoleServer>,
         Parameters(args): Parameters<analysis::AnalyzeCaptureArgs>,
     ) -> Result<Json<analysis::AnalyzeReport>, String> {
-        done(analysis::handle_pix_analyze_capture(args).await)
+        done(
+            with_progress(
+                &context,
+                "Analyzing PIX capture",
+                analysis::handle_pix_analyze_capture(args),
+            )
+            .await,
+        )
     }
 
     #[tool(
@@ -421,9 +799,17 @@ impl PixServer {
     )]
     async fn pix_analyze_frame(
         &self,
+        context: RequestContext<RoleServer>,
         Parameters(args): Parameters<analysis::AnalyzeFrameArgs>,
     ) -> Result<Json<analysis::FrameInsights>, String> {
-        done(analysis::handle_pix_analyze_frame(args).await)
+        done(
+            with_progress(
+                &context,
+                "Analyzing captured frame",
+                analysis::handle_pix_analyze_frame(args),
+            )
+            .await,
+        )
     }
 
     #[tool(
@@ -431,13 +817,36 @@ impl PixServer {
         description = "Extract the event list (D3D12 API calls, draw calls, GPU events) from a \
                        capture. Returns a paginated slice (offset/limit/response_format) or saves \
                        the full CSV when output_path is given.",
-        annotations(title = "Get event list", destructive_hint = true)
+        annotations(title = "Get event list", destructive_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<analysis::EventListReport>()
+            .expect("EventListReport must produce a valid object output schema"),
     )]
     async fn pix_get_event_list(
         &self,
+        context: RequestContext<RoleServer>,
         Parameters(args): Parameters<analysis::EventListArgs>,
-    ) -> Result<Json<analysis::EventListReport>, String> {
-        done(analysis::handle_pix_get_event_list(args).await)
+    ) -> Result<CallToolResult, McpError> {
+        let result = with_progress(
+            &context,
+            "Extracting PIX event list",
+            analysis::handle_pix_get_event_list(args),
+        )
+        .await;
+        structured_call_result(result, |report| {
+            report
+                .output_path
+                .as_deref()
+                .and_then(|path| {
+                    resources::local_artifact_resource(
+                        &self.artifact_registry,
+                        path,
+                        "PIX event list",
+                        "text/csv",
+                    )
+                })
+                .into_iter()
+                .collect()
+        })
     }
 
     #[tool(
@@ -475,20 +884,24 @@ impl PixServer {
         let rtv_index = args.rtv_index;
         let capture_path = args.capture_path;
 
-        match analysis::handle_pix_get_screenshot(analysis::ScreenshotRequest {
-            capture_path,
-            output_path,
-            depth,
-            marker,
-            global_id,
-            rtv_index,
-            embed_image: embed,
-            max_dimension: max_dim,
-            replace_existing: true,
-        })
-        .await
-        {
-            Ok(res) => screenshot_call_result(res),
+        let result = with_progress(
+            &context,
+            "Extracting PIX screenshot",
+            analysis::handle_pix_get_screenshot(analysis::ScreenshotRequest {
+                capture_path,
+                output_path,
+                depth,
+                marker,
+                global_id,
+                rtv_index,
+                embed_image: embed,
+                max_dimension: max_dim,
+                replace_existing: true,
+            }),
+        )
+        .await;
+        match result {
+            Ok(res) => screenshot_call_result(&self.artifact_registry, res),
             Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(
                 e.to_string(),
             )])),
@@ -503,9 +916,17 @@ impl PixServer {
     )]
     async fn pix_list_counters(
         &self,
+        context: RequestContext<RoleServer>,
         Parameters(args): Parameters<analysis::ListCountersArgs>,
     ) -> Result<Json<analysis::CountersReport>, String> {
-        done(analysis::handle_pix_list_counters(args).await)
+        done(
+            with_progress(
+                &context,
+                "Listing PIX performance counters",
+                analysis::handle_pix_list_counters(args),
+            )
+            .await,
+        )
     }
 
     #[tool(
@@ -517,9 +938,17 @@ impl PixServer {
     )]
     async fn pix_run_analysis(
         &self,
+        context: RequestContext<RoleServer>,
         Parameters(args): Parameters<analysis::CapturePathArgs>,
     ) -> Result<Json<analysis::RunAnalysisReport>, String> {
-        done(analysis::handle_pix_run_analysis(args).await)
+        done(
+            with_progress(
+                &context,
+                "Replaying capture with the debug layer",
+                analysis::handle_pix_run_analysis(args),
+            )
+            .await,
+        )
     }
 
     #[tool(
@@ -529,9 +958,17 @@ impl PixServer {
     )]
     async fn pix_export_counters(
         &self,
+        context: RequestContext<RoleServer>,
         Parameters(args): Parameters<analysis::ExportCountersArgs>,
     ) -> Result<Json<analysis::ExportCountersReport>, String> {
-        done(analysis::handle_pix_export_counters(args).await)
+        done(
+            with_progress(
+                &context,
+                "Parsing PIX counter export",
+                analysis::handle_pix_export_counters(args),
+            )
+            .await,
+        )
     }
 
     #[tool(
@@ -552,22 +989,57 @@ impl PixServer {
         description = "One-shot workflow: launch an executable, take a GPU capture, and return a \
                        frame-insights summary (and optionally a screenshot). Fewer round-trips \
                        than launch + capture + analyze separately.",
-        annotations(title = "Capture and analyze", destructive_hint = true)
+        annotations(title = "Capture and analyze", destructive_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<workflow::CaptureAndAnalyzeReport>()
+            .expect("CaptureAndAnalyzeReport must produce a valid object output schema"),
     )]
     async fn pix_capture_and_analyze(
         &self,
         context: RequestContext<RoleServer>,
         Parameters(mut args): Parameters<workflow::CaptureAndAnalyzeArgs>,
-    ) -> Result<Json<workflow::CaptureAndAnalyzeReport>, String> {
+    ) -> Result<CallToolResult, McpError> {
         args.output_path = Some(
-            resolve_output_path(
+            match resolve_output_path(
                 &context,
                 args.output_path,
                 "Where should the capture (.wpix) be saved?",
             )
-            .await?,
+            .await
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(error)]));
+                }
+            },
         );
-        done(workflow::handle_pix_capture_and_analyze(args).await)
+        let result = with_progress(
+            &context,
+            "Capturing and analyzing PIX frame",
+            workflow::handle_pix_capture_and_analyze(args),
+        )
+        .await;
+        structured_call_result(result, |report| {
+            let mut links = Vec::new();
+            if let Some(resource) = resources::local_artifact_resource(
+                &self.artifact_registry,
+                &report.capture_path,
+                "PIX GPU capture",
+                "application/octet-stream",
+            ) {
+                links.push(resource);
+            }
+            if let Some(resource) = report.screenshot_path.as_deref().and_then(|path| {
+                resources::local_artifact_resource(
+                    &self.artifact_registry,
+                    path,
+                    "PIX screenshot",
+                    "image/png",
+                )
+            }) {
+                links.push(resource);
+            }
+            links
+        })
     }
 }
 
@@ -622,10 +1094,13 @@ impl ServerHandler for PixServer {
 
     async fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(self.tool_router.list_all()))
+        reject_cursor(request.as_ref(), "tools/list")?;
+        let mut tools = self.tool_router.list_all();
+        tools.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(ListToolsResult::with_all_items(tools))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
@@ -634,33 +1109,70 @@ impl ServerHandler for PixServer {
 
     async fn list_resources(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        Ok(ListResourcesResult::with_all_items(vec![
-            Resource::new("capture://list", "PIX capture list").with_mime_type("application/json"),
-        ]))
+        let captures_dir = crate::security::capture_directory().map_err(|error| {
+            McpError::internal_error(
+                "Could not resolve the PIX capture resource directory",
+                Some(serde_json::json!({ "reason": error.to_string() })),
+            )
+        })?;
+        let resources = resources::list_capture_resources(Some(&captures_dir))
+            .await
+            .map_err(|error| {
+                McpError::internal_error(
+                    "Could not build the PIX capture resource catalog",
+                    Some(serde_json::json!({ "reason": error.to_string() })),
+                )
+            })?;
+        let total = resources.len();
+        let generation = resource_catalog_generation(&resources);
+        let offset = resource_cursor_offset(request.as_ref(), generation, total)?;
+        let page: Vec<_> = resources
+            .into_iter()
+            .skip(offset)
+            .take(RESOURCE_PAGE_SIZE)
+            .collect();
+        let next_offset = offset.saturating_add(page.len());
+        let mut result = ListResourcesResult::with_all_items(page);
+        if next_offset < total {
+            result.next_cursor = Some(format!(
+                "{RESOURCE_CURSOR_PREFIX}{generation:016x}:{next_offset}"
+            ));
+        }
+        Ok(result)
     }
 
     async fn list_resource_templates(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, McpError> {
-        Ok(ListResourceTemplatesResult::with_all_items(vec![
+        reject_cursor(request.as_ref(), "resources/templates/list")?;
+        let annotations = Annotations::default()
+            .with_audience(vec![Role::Assistant])
+            .with_priority(0.8);
+        let mut templates = vec![
             ResourceTemplate::new("capture://{id}", "PIX capture")
                 .with_description("Metadata for a .wpix capture in the server capture directory")
-                .with_mime_type("application/json"),
+                .with_mime_type("application/json")
+                .with_annotations(annotations.clone()),
             ResourceTemplate::new("capture://{id}/metadata", "PIX capture metadata")
                 .with_description("File metadata for a .wpix capture")
-                .with_mime_type("application/json"),
+                .with_mime_type("application/json")
+                .with_annotations(annotations.clone()),
             ResourceTemplate::new("capture://{id}/events", "PIX capture events")
                 .with_description("A validated capture reference and guidance for event export")
-                .with_mime_type("application/json"),
+                .with_mime_type("application/json")
+                .with_annotations(annotations.clone()),
             ResourceTemplate::new("capture://{id}/counters", "PIX capture counters")
                 .with_description("A validated capture reference and guidance for counters")
-                .with_mime_type("application/json"),
-        ]))
+                .with_mime_type("application/json")
+                .with_annotations(annotations),
+        ];
+        templates.sort_by(|left, right| left.uri_template.cmp(&right.uri_template));
+        Ok(ListResourceTemplatesResult::with_all_items(templates))
     }
 
     async fn read_resource(
@@ -669,14 +1181,25 @@ impl ServerHandler for PixServer {
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
         let uri = request.uri.clone();
+        if uri.starts_with("artifact://") {
+            let payload = resources::read_artifact_resource(&self.artifact_registry, &uri)
+                .await
+                .map_err(|error| map_resource_error(error, &uri))?;
+            let contents = match payload {
+                resources::ArtifactPayload::Text { text, mime_type } => {
+                    ResourceContents::text(text, uri).with_mime_type(mime_type)
+                }
+                resources::ArtifactPayload::Blob { base64, mime_type } => {
+                    ResourceContents::blob(base64, uri).with_mime_type(mime_type)
+                }
+            };
+            return Ok(ReadResourceResult::new(vec![contents]));
+        }
         match resources::read_capture_resource_text(&uri, None).await {
             Ok(text) => Ok(ReadResourceResult::new(vec![
                 ResourceContents::text(text, uri).with_mime_type("application/json"),
             ])),
-            Err(e) => Err(McpError::resource_not_found(
-                e.to_string(),
-                Some(serde_json::json!({ "uri": uri })),
-            )),
+            Err(error) => Err(map_resource_error(error, &uri)),
         }
     }
 }
@@ -817,11 +1340,13 @@ mod tests {
         let tools = server.tool_router.list_all();
 
         for name in [
+            "pix_launch_and_capture",
             "pix_gpu_capture",
             "pix_gpu_capture_launch",
             "pix_timing_capture",
             "pix_get_event_list",
             "pix_get_screenshot",
+            "pix_capture_and_analyze",
         ] {
             let tool = tools
                 .iter()
@@ -835,23 +1360,30 @@ mod tests {
 
     #[test]
     fn screenshot_response_mirrors_structured_content_as_json_text() {
-        let result = screenshot_call_result(analysis::ScreenshotResult {
-            report: analysis::ScreenshotReport {
-                success: true,
-                output_path: r"C:\captures\frame.png".to_string(),
-                file_size_bytes: 42,
-                message: "Screenshot saved".to_string(),
-                image_embedded: true,
+        let directory = tempfile::tempdir().expect("artifact directory");
+        let screenshot = directory.path().join("frame.png");
+        std::fs::write(&screenshot, b"png").expect("write screenshot fixture");
+        let registry = resources::ArtifactRegistry::default();
+        let result = screenshot_call_result(
+            &registry,
+            analysis::ScreenshotResult {
+                report: analysis::ScreenshotReport {
+                    success: true,
+                    output_path: screenshot.to_string_lossy().into_owned(),
+                    file_size_bytes: 3,
+                    message: "Screenshot saved".to_string(),
+                    image_embedded: true,
+                },
+                image_b64: Some("cG5n".to_string()),
             },
-            image_b64: Some("cG5n".to_string()),
-        })
+        )
         .expect("screenshot response should serialize");
 
         let structured = result
             .structured_content
             .as_ref()
             .expect("structured content");
-        assert_eq!(result.content.len(), 2);
+        assert_eq!(result.content.len(), 3);
         assert_eq!(result.content[0].as_image().expect("image").data, "cG5n");
 
         let text = &result.content[1].as_text().expect("JSON text").text;
@@ -859,11 +1391,113 @@ mod tests {
         let text_json: serde_json::Value =
             serde_json::from_str(text).expect("text must contain valid JSON");
         assert_eq!(&text_json, structured);
+
+        let resource = result.content[2]
+            .as_resource_link()
+            .expect("screenshot resource link");
+        assert_eq!(resource.mime_type.as_deref(), Some("image/png"));
+        assert!(resource.uri.starts_with("artifact://local/"));
     }
 
     #[test]
     fn server_does_not_advertise_broken_upstream_task_execution() {
         let info = PixServer::new().get_info();
         assert!(info.capabilities.tasks.is_none());
+    }
+
+    #[test]
+    fn server_does_not_overclaim_resource_catalog_changes() {
+        let info = PixServer::new().get_info();
+        assert_eq!(
+            info.capabilities
+                .resources
+                .and_then(|resources| resources.list_changed),
+            None
+        );
+    }
+
+    #[test]
+    fn progress_gate_is_monotone_and_rate_limited() {
+        let start = tokio::time::Instant::now();
+        let mut gate = ProgressGate::default();
+
+        assert!(gate.admit(0.0, start, true));
+        assert!(!gate.admit(0.0, start, true));
+        assert!(!gate.admit(1.0, start + PROGRESS_NOTIFICATION_INTERVAL / 2, false));
+        assert!(gate.admit(2.0, start + PROGRESS_NOTIFICATION_INTERVAL, false));
+        assert!(!gate.admit(1.5, start + PROGRESS_NOTIFICATION_INTERVAL * 2, true));
+        assert!(gate.admit(3.0, start + PROGRESS_NOTIFICATION_INTERVAL, true));
+    }
+
+    #[test]
+    fn resource_cursors_are_opaque_and_strictly_validated() {
+        let generation = 0x1234;
+        let total = 250;
+        let first_page = PaginatedRequestParams::default();
+        assert_eq!(
+            resource_cursor_offset(Some(&first_page), generation, total).unwrap(),
+            0
+        );
+
+        let second_page = PaginatedRequestParams::default().with_cursor(Some(format!(
+            "{RESOURCE_CURSOR_PREFIX}{generation:016x}:100"
+        )));
+        assert_eq!(
+            resource_cursor_offset(Some(&second_page), generation, total).unwrap(),
+            100
+        );
+
+        let unknown = PaginatedRequestParams::default().with_cursor(Some("100".to_string()));
+        assert!(resource_cursor_offset(Some(&unknown), generation, total).is_err());
+        assert!(reject_cursor(Some(&unknown), "tools/list").is_err());
+
+        let stale = PaginatedRequestParams::default().with_cursor(Some(format!(
+            "{RESOURCE_CURSOR_PREFIX}0000000000009999:100"
+        )));
+        assert!(resource_cursor_offset(Some(&stale), generation, total).is_err());
+
+        let fabricated = PaginatedRequestParams::default()
+            .with_cursor(Some(format!("{RESOURCE_CURSOR_PREFIX}{generation:016x}:1")));
+        assert!(resource_cursor_offset(Some(&fabricated), generation, total).is_err());
+    }
+
+    #[test]
+    fn structured_results_can_include_artifact_links() {
+        let directory = tempfile::tempdir().expect("artifact directory");
+        let capture = directory.path().join("capture.wpix");
+        std::fs::write(&capture, b"capture").expect("write capture");
+        let path = capture.to_string_lossy().into_owned();
+        let registry = resources::ArtifactRegistry::default();
+
+        let result = structured_call_result(
+            Ok(capture::CaptureReport {
+                success: true,
+                message: "captured".to_string(),
+                output_path: path,
+                pixtool_output: String::new(),
+                note: None,
+            }),
+            |report| {
+                resources::local_artifact_resource(
+                    &registry,
+                    &report.output_path,
+                    "PIX GPU capture",
+                    "application/octet-stream",
+                )
+                .into_iter()
+                .collect()
+            },
+        )
+        .expect("structured tool result");
+
+        assert!(result.structured_content.is_some());
+        let link = result
+            .content
+            .iter()
+            .find_map(ContentBlock::as_resource_link)
+            .expect("capture resource link");
+        assert_eq!(link.size, None);
+        assert_eq!(link.mime_type.as_deref(), Some("application/json"));
+        assert!(link.uri.starts_with("artifact://local/"));
     }
 }
