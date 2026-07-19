@@ -1,26 +1,33 @@
 [package]
 name = "pix-mcp"
 version = "0.1.1"
-edition = "2021"
+edition = "2024"
+rust-version = "1.88"
 description = "Model Context Protocol (MCP) server for debugging DirectX 12 apps with Microsoft PIX"
 license = "MIT"
 authors = ["Alessandro Pozone <alessandro.pozone@hotmail.com>"]
 repository = "https://github.com/pozlabs/pix-mcp"
 homepage = "https://github.com/pozlabs/pix-mcp"
 readme = "README.md"
+exclude = [".github/"]
 keywords = ["mcp", "pix", "directx12", "gpu", "debugging"]
 categories = ["development-tools::debugging", "command-line-utilities", "graphics"]
 
 [dependencies]
 # Official Model Context Protocol SDK (server + stdio transport + schema generation + elicitation)
-rmcp = { version = "1", features = ["server", "macros", "transport-io", "schemars", "elicitation"] }
+rmcp = { version = "2.2.0", default-features = false, features = ["server", "macros", "transport-io", "schemars", "elicitation"] }
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "process", "sync", "time"] }
 
 # JSON serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# CSV import/export and safe temporary files for pixtool output
+csv = "1.4"
+tempfile = "3.27"
+percent-encoding = "2"
 
 # Base64 encoding for inline image content
 base64 = "0.22"
@@ -29,7 +36,7 @@ base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Error handling
-anyhow = "1"
+anyhow = "1.0.104"
 
 # Logging
 tracing = "0.1"
@@ -37,7 +44,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Windows APIs (used for the elevation check in pix_status)
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = [
+process-wrap = { version = "9.1.0", default-features = false, features = ["tokio1", "job-object"] }
+windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
     "Win32_Security",

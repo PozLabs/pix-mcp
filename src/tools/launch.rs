@@ -27,7 +27,7 @@ pub struct LaunchAndCaptureArgs {
     /// Command line arguments to pass to the executable.
     #[serde(default)]
     pub args: Option<Vec<String>>,
-    /// Path to save the capture file (.wpix). If omitted, save the capture from PIX manually.
+    /// Path to save the capture file (.wpix). If omitted, open the capture in PIX.
     #[serde(default)]
     pub capture_file: Option<String>,
     /// Working directory for the executable.
@@ -39,7 +39,8 @@ pub struct LaunchAndCaptureArgs {
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct LaunchReport {
     pub success: bool,
-    /// Process ID of the launched application.
+    /// Process ID of the pixtool launcher, not the target application. For a
+    /// completed capture this launcher may already have exited.
     pub process_id: u32,
     /// Human-readable status message.
     pub message: String,
@@ -51,7 +52,7 @@ pub async fn handle_pix_launch(args: LaunchArgs) -> Result<LaunchReport> {
     let cmd_args_ref: Vec<&str> = cmd_args.iter().map(|s| s.as_str()).collect();
     let working_dir = args.working_dir.map(PathBuf::from);
 
-    let result = PixTool::launch(&exe_path, &cmd_args_ref, working_dir.as_deref())?;
+    let result = PixTool::launch(&exe_path, &cmd_args_ref, working_dir.as_deref()).await?;
 
     Ok(LaunchReport {
         success: true,
@@ -64,7 +65,13 @@ pub async fn handle_pix_launch_and_capture(args: LaunchAndCaptureArgs) -> Result
     let exe_path = PathBuf::from(&args.exe_path);
     let cmd_args = args.args.unwrap_or_default();
     let cmd_args_ref: Vec<&str> = cmd_args.iter().map(|s| s.as_str()).collect();
-    let capture_file = args.capture_file.map(PathBuf::from);
+    let capture_file = match args.capture_file {
+        Some(path) => Some(super::capture::normalize_wpix_output(
+            &path,
+            "capture_file",
+        )?),
+        None => None,
+    };
     let working_dir = args.working_dir.map(PathBuf::from);
 
     let result = PixTool::launch_and_capture(
@@ -72,7 +79,8 @@ pub async fn handle_pix_launch_and_capture(args: LaunchAndCaptureArgs) -> Result
         &cmd_args_ref,
         capture_file.as_deref(),
         working_dir.as_deref(),
-    )?;
+    )
+    .await?;
 
     Ok(LaunchReport {
         success: true,
