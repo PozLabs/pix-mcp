@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::pix::PixTool;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LaunchArgs {
     /// Path to the executable to launch.
     pub exe_path: String,
@@ -21,6 +22,7 @@ pub struct LaunchArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LaunchAndCaptureArgs {
     /// Path to the executable to launch.
     pub exe_path: String,

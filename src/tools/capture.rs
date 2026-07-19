@@ -15,8 +15,10 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
 use crate::pix::PixTool;
+use crate::security;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GpuCaptureArgs {
     /// Process ID (PID) of the running DX12 application to capture.
     #[schemars(range(min = 1))]
@@ -27,6 +29,7 @@ pub struct GpuCaptureArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GpuCaptureLaunchArgs {
     /// Path to the executable to launch.
     pub exe_path: String,
@@ -46,6 +49,7 @@ pub struct GpuCaptureLaunchArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TimingCaptureArgs {
     /// Process ID (PID) of the running application to capture.
     #[schemars(range(min = 1))]
@@ -60,6 +64,7 @@ pub struct TimingCaptureArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListCapturesArgs {
     /// Directory to search for capture files (defaults to the current directory).
     #[serde(default)]
@@ -74,6 +79,7 @@ pub struct ListCapturesArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct OpenCaptureArgs {
     /// Path to the capture file to open in the PIX GUI.
     pub capture_path: String,
@@ -220,8 +226,9 @@ pub async fn handle_pix_list_captures(args: ListCapturesArgs) -> Result<CaptureL
             return Err(anyhow::anyhow!("directory must not be empty"));
         }
         Some(directory) => PathBuf::from(directory),
-        None => std::env::current_dir()?,
+        None => security::capture_directory()?,
     };
+    let directory = security::validate_input_directory(&directory, "Capture directory")?;
 
     let scan_directory = directory.clone();
     let captures = tokio::task::spawn_blocking(move || PixTool::list_captures(&scan_directory))

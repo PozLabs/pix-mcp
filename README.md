@@ -138,7 +138,9 @@ affect this server:
 - **`pix_run_analysis` validates replay, not the complete diagnostic stream.** The
   `run-debug-layer` verb replays with the D3D12 debug layer but does not export its messages, so an
   empty issue list must not be interpreted as proof that the debug layer emitted no diagnostics.
-- **Processes are bounded.** Foreground operations use a two-process pool and wait up to 30 seconds
+- **Processes are bounded.** MCP tool calls use a global eight-request limit by default
+  (`PIX_MCP_MAX_CONCURRENT_TOOLS` can set `1..=64`) and wait at most 30 seconds for a slot.
+  Foreground operations use a two-process pool and wait up to 30 seconds
   for capacity before their execution timeout starts. Background launches use a separate
   four-process pool; a fifth concurrent
   background launch fails immediately instead of waiting. Foreground operations time out after
@@ -162,17 +164,25 @@ affect this server:
 
 ## Trust Model
 
-Run this server only for a trusted MCP client. The tools intentionally inherit the server user's
-local permissions: a client can launch an executable chosen by path, interact with processes, read
-capture/counter files, and read or write requested local paths. The server validates inputs and
-output artifacts, but it is not a sandbox and does not implement a path or executable allowlist.
-Do not expose it to untrusted or multi-tenant clients.
+Run this server only for a trusted MCP client. The tools inherit the server user's local permissions
+and this policy layer is defense in depth, not an OS sandbox. Windows device/verbatim namespaces,
+alternate data streams, reserved device names, ambiguous drive-relative paths, and UNC paths are
+rejected by default. Existing paths and output parents are canonicalized before allowlist checks, so
+junction/symlink targets cannot escape a configured root.
+
+For least privilege, configure `PIX_MCP_INPUT_ROOTS`, `PIX_MCP_OUTPUT_ROOTS`, and
+`PIX_MCP_EXECUTABLE_ROOTS`. When an input/output root variable is present, the captures directory is
+implicitly allowed; an empty input/output value therefore restricts that class to the captures
+directory alone. Unset root variables retain the previous local-path behavior for compatibility.
+Run normal launch/GPU-capture workflows non-elevated. An elevated server can perform timing captures
+by PID, but refuses user-controlled application launches unless the operator explicitly sets
+`PIX_MCP_ALLOW_ELEVATED_LAUNCH=true`.
 
 ## MCP Resources
 
 | Resource URI | Description |
 |--------------|-------------|
-| `capture://list` | List up to 500 captures in the server's current working directory (`directory`, `total_count`, and `truncated` are returned) |
+| `capture://list` | List up to 500 captures in `PIX_MCP_CAPTURES_DIR` (or the server working directory when unset); `directory`, `total_count`, and `truncated` are returned |
 | `capture://{id}` | Get metadata for a specific capture |
 | `capture://{id}/metadata` | Get file metadata for a capture |
 | `capture://{id}/events` | Hint to use the `pix_get_event_list` tool |
@@ -229,7 +239,17 @@ Agent: "Debug the rendering issue in my game"
 | Variable | Description |
 |----------|-------------|
 | `PIXTOOL_PATH` | Override path to pixtool.exe |
+| `PIX_MCP_CAPTURES_DIR` | Existing default directory for capture listing/resources (defaults to the server working directory) |
+| `PIX_MCP_INPUT_ROOTS` | Semicolon-separated existing directories allowed for capture/counter reads; when set, the captures directory is also allowed |
+| `PIX_MCP_OUTPUT_ROOTS` | Semicolon-separated existing directories allowed for `.wpix`, CSV, and PNG outputs; when set, the captures directory is also allowed |
+| `PIX_MCP_EXECUTABLE_ROOTS` | Semicolon-separated existing directories allowed for target executables and working directories |
+| `PIX_MCP_ALLOW_UNC_PATHS` | Opt in to UNC paths (`false` by default); device/verbatim namespaces remain forbidden |
+| `PIX_MCP_ALLOW_ELEVATED_LAUNCH` | Allow user-selected application launches from an elevated server (`false` by default) |
+| `PIX_MCP_MAX_CONCURRENT_TOOLS` | Global concurrent MCP tool-call limit (`8` by default, range `1..=64`) |
 | `RUST_LOG` | Set logging level (e.g., `debug`, `info`) |
+
+Relative capture, counter, CSV, and PNG paths are resolved against `PIX_MCP_CAPTURES_DIR`.
+Relative executable and working-directory paths remain relative to the server process directory.
 
 ## Architecture
 

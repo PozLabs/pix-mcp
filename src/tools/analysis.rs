@@ -21,6 +21,7 @@ use crate::pix::pixtool::PROCESS_OUTPUT_TRUNCATION_MARKER;
 use crate::pix::pixtool::{
     PROCESS_OUTPUT_DIAGNOSTIC_PREFIX, check_developer_mode, push_value_option, run_pixtool_command,
 };
+use crate::security;
 
 /// How much detail to return inline from list-style tools.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, schemars::JsonSchema)]
@@ -68,10 +69,11 @@ fn require_capture_file(raw_path: &str) -> Result<PathBuf> {
     if raw_path.trim().is_empty() {
         return Err(anyhow::anyhow!("capture_path must not be empty"));
     }
-    let path = PathBuf::from(raw_path);
-    if !path.is_file() {
+    let requested_path = security::resolve_artifact_path(Path::new(raw_path), "Capture path")?;
+    if !requested_path.is_file() {
         return Err(capture_not_found(raw_path));
     }
+    let path = security::validate_input_file(&requested_path, "Capture path")?;
     if std::fs::metadata(&path)?.len() == 0 {
         return Err(anyhow::anyhow!("Capture file is empty: {}", raw_path));
     }
@@ -122,7 +124,10 @@ fn event_output_path(raw: Option<&str>) -> Result<Option<PathBuf>> {
             "output_path must end with .csv; refusing to risk overwriting a non-CSV file"
         ));
     }
-    Ok(Some(path))
+    Ok(Some(security::validate_output_file(
+        &path,
+        "Event-list output path",
+    )?))
 }
 
 /// Parsed UTF-8 CSV data. `csv::StringRecord` preserves logical records even
@@ -645,6 +650,7 @@ fn validate_screenshot_options(
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ExportCountersArgs {
     /// Path to the PIX-exported counters file (CSV or JSON).
     pub file_path: String,
@@ -654,6 +660,7 @@ pub struct ExportCountersArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CompareCapturesArgs {
     /// Path to the first capture file (baseline).
     pub capture_a: String,
@@ -662,6 +669,7 @@ pub struct CompareCapturesArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AnalyzeCaptureArgs {
     /// Path to the .wpix capture file.
     pub capture_path: String,
@@ -675,6 +683,7 @@ pub struct AnalyzeCaptureArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EventListArgs {
     /// Path to the .wpix capture file.
     pub capture_path: String,
@@ -699,6 +708,7 @@ pub struct EventListArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ScreenshotArgs {
     /// Path to the .wpix capture file.
     pub capture_path: String,
@@ -732,12 +742,14 @@ pub struct ScreenshotArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CapturePathArgs {
     /// Path to the .wpix capture file.
     pub capture_path: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListCountersArgs {
     /// Path to the .wpix capture file.
     pub capture_path: String,
@@ -751,6 +763,7 @@ pub struct ListCountersArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AnalyzeFrameArgs {
     /// Path to the .wpix capture file.
     pub capture_path: String,
@@ -916,7 +929,7 @@ pub async fn handle_pix_export_counters(args: ExportCountersArgs) -> Result<Expo
 }
 
 fn export_counters(args: ExportCountersArgs) -> Result<ExportCountersReport> {
-    let path = PathBuf::from(&args.file_path);
+    let path = security::validate_input_file(Path::new(&args.file_path), "Counter export")?;
     let bytes = read_file_limited(&path, MAX_COUNTER_EXPORT_BYTES, "Counter export")?;
     let content = String::from_utf8(bytes).context("Counter export is not valid UTF-8")?;
 
@@ -1079,12 +1092,12 @@ fn compare_captures(args: CompareCapturesArgs) -> Result<CompareReport> {
     Ok(CompareReport {
         success: true,
         capture_a: CaptureSide {
-            path: args.capture_a,
+            path: path_a.to_string_lossy().into_owned(),
             size_bytes: size_a,
             modified: meta_a.modified().ok().map(to_secs),
         },
         capture_b: CaptureSide {
-            path: args.capture_b,
+            path: path_b.to_string_lossy().into_owned(),
             size_bytes: size_b,
             modified: meta_b.modified().ok().map(to_secs),
         },
@@ -1122,7 +1135,7 @@ pub async fn handle_pix_analyze_capture(args: AnalyzeCaptureArgs) -> Result<Anal
 
     let pixtool = PixTool::find()?;
     let mut cmd = Command::new(&pixtool);
-    cmd.arg("open-capture").arg(&args.capture_path);
+    cmd.arg("open-capture").arg(&path);
     cmd.arg("save-event-list").arg(event_csv.as_os_str());
     if include_counters {
         push_value_option(&mut cmd, "--counters", counter_pattern)?;
@@ -1144,19 +1157,20 @@ pub async fn handle_pix_analyze_capture(args: AnalyzeCaptureArgs) -> Result<Anal
             anyhow::anyhow!(
                 "Failed to extract a valid event list: {}\nstdout: {}\nstderr: {}",
                 error,
-                stdout,
-                stderr
+                public_process_output(&stdout),
+                public_process_output(&stderr)
             )
         })?;
     let events = analyze_events_summary(&parsed)?;
 
     let metadata = std::fs::metadata(&path)?;
-    let (pixtool_output, _) = truncate_utf8(&stdout, MAX_INLINE_PROCESS_OUTPUT_BYTES);
+    let public_stdout = public_process_output(&stdout);
+    let (pixtool_output, _) = truncate_utf8(&public_stdout, MAX_INLINE_PROCESS_OUTPUT_BYTES);
     let report = AnalyzeReport {
         // PIX's documented spurious -1 status is accepted only when the CSV is
         // valid and the process emitted no explicit failure diagnostics.
         success: true,
-        capture_path: args.capture_path,
+        capture_path: path.to_string_lossy().into_owned(),
         file_size_bytes: metadata.len(),
         file_size_mb: format!("{:.2}", metadata.len() as f64 / 1_048_576.0),
         events,
@@ -1176,7 +1190,7 @@ pub async fn handle_pix_analyze_capture(args: AnalyzeCaptureArgs) -> Result<Anal
 // ---------------------------------------------------------------------------
 
 pub async fn handle_pix_get_event_list(args: EventListArgs) -> Result<EventListReport> {
-    require_capture_file_async(args.capture_path.clone()).await?;
+    let capture_path = require_capture_file_async(args.capture_path.clone()).await?;
     let format = args.response_format.unwrap_or(ResponseFormat::Summary);
     let limit = event_list_limit(args.limit, format)?;
 
@@ -1185,7 +1199,7 @@ pub async fn handle_pix_get_event_list(args: EventListArgs) -> Result<EventListR
 
     let pixtool = PixTool::find()?;
     let mut cmd = Command::new(&pixtool);
-    cmd.arg("open-capture").arg(&args.capture_path);
+    cmd.arg("open-capture").arg(&capture_path);
     cmd.arg("save-event-list").arg(csv_path.as_os_str());
     if let Some(pattern) = args.counters.as_deref() {
         if pattern.trim().is_empty() {
@@ -1215,8 +1229,8 @@ pub async fn handle_pix_get_event_list(args: EventListArgs) -> Result<EventListR
                 anyhow::anyhow!(
                     "Failed to generate a valid event list: {}\nstdout: {}\nstderr: {}",
                     error,
-                    stdout,
-                    stderr
+                    public_process_output(&stdout),
+                    public_process_output(&stderr)
                 )
             })?;
         persist_temp_path_async(csv_path, output_path.clone(), true).await?;
@@ -1248,8 +1262,8 @@ pub async fn handle_pix_get_event_list(args: EventListArgs) -> Result<EventListR
             anyhow::anyhow!(
                 "Failed to generate a valid event list: {}\nstdout: {}\nstderr: {}",
                 error,
-                stdout,
-                stderr
+                public_process_output(&stdout),
+                public_process_output(&stderr)
             )
         })?;
     let page = event_page(&parsed, args.offset.unwrap_or(0), limit)?;
@@ -1318,7 +1332,7 @@ pub async fn handle_pix_get_screenshot(req: ScreenshotRequest) -> Result<Screens
         replace_existing,
     } = req;
 
-    require_capture_file_async(capture_path.clone()).await?;
+    let capture_file = require_capture_file_async(capture_path.clone()).await?;
     validate_screenshot_options(
         depth,
         marker.as_deref(),
@@ -1336,12 +1350,14 @@ pub async fn handle_pix_get_screenshot(req: ScreenshotRequest) -> Result<Screens
     } else {
         format!("{}.png", output_path)
     };
-    let output_file = PathBuf::from(&output_path);
+    let output_file =
+        security::validate_output_file(Path::new(&output_path), "Screenshot output path")?;
+    let output_path = output_file.to_string_lossy().into_owned();
     let temp_output = fresh_temp_path_async(".png", Some(output_file.clone())).await?;
 
     let pixtool = PixTool::find()?;
     let mut cmd = Command::new(&pixtool);
-    cmd.arg("open-capture").arg(&capture_path);
+    cmd.arg("open-capture").arg(&capture_file);
 
     // Two documented paths:
     //  - `save-screenshot <png>`: the screenshot recorded when the capture was
@@ -1390,8 +1406,8 @@ pub async fn handle_pix_get_screenshot(req: ScreenshotRequest) -> Result<Screens
             return Err(anyhow::anyhow!(
                 "Failed to save a valid screenshot: {}\nstdout: {}\nstderr: {}",
                 validation_error,
-                stdout,
-                stderr
+                public_process_output(&stdout),
+                public_process_output(&stderr)
             ));
         }
     };
@@ -1610,6 +1626,7 @@ fn bounded_diagnostic_lines(lines: Vec<String>) -> Result<(usize, Vec<String>, b
     let mut used_bytes = 2usize;
     let mut content_truncated = false;
     for line in lines {
+        let line = public_process_output(&line);
         let (line, line_truncated) = truncate_utf8(&line, MAX_COUNTER_NAME_BYTES);
         let encoded_bytes = serde_json::to_vec(&line)?.len().saturating_add(1);
         if used_bytes.saturating_add(encoded_bytes) > MAX_INLINE_DIAGNOSTICS_JSON_BYTES {
@@ -1624,12 +1641,18 @@ fn bounded_diagnostic_lines(lines: Vec<String>) -> Result<(usize, Vec<String>, b
 }
 
 fn combined_process_output(stdout: &str, stderr: &str) -> String {
+    let stdout = public_process_output(stdout);
+    let stderr = public_process_output(stderr);
     match (stdout.trim().is_empty(), stderr.trim().is_empty()) {
         (true, true) => String::new(),
-        (false, true) => stdout.to_string(),
+        (false, true) => stdout,
         (true, false) => format!("stderr:\n{stderr}"),
         (false, false) => format!("stdout:\n{stdout}\nstderr:\n{stderr}"),
     }
+}
+
+fn public_process_output(output: &str) -> String {
+    crate::security::sanitize_process_output(output)
 }
 
 fn is_counter_output_line(line: &str) -> bool {
@@ -1649,7 +1672,7 @@ fn is_counter_output_line(line: &str) -> bool {
 }
 
 pub async fn handle_pix_list_counters(args: ListCountersArgs) -> Result<CountersReport> {
-    require_capture_file_async(args.capture_path.clone()).await?;
+    let capture_path = require_capture_file_async(args.capture_path.clone()).await?;
     if args.limit == Some(0) {
         return Err(anyhow::anyhow!("limit must be at least 1"));
     }
@@ -1658,7 +1681,7 @@ pub async fn handle_pix_list_counters(args: ListCountersArgs) -> Result<Counters
     let mut command = Command::new(&pixtool);
     command
         .arg("open-capture")
-        .arg(&args.capture_path)
+        .arg(&capture_path)
         .arg("list-counters");
     let output = run_pixtool_command(command, ANALYSIS_TIMEOUT, "pixtool counter listing").await?;
 
@@ -1670,8 +1693,8 @@ pub async fn handle_pix_list_counters(args: ListCountersArgs) -> Result<Counters
         return Err(anyhow::anyhow!(
             "pixtool failed to list counters with status {}.\nstdout: {}\nstderr: {}",
             output.status,
-            stdout,
-            stderr
+            public_process_output(&stdout),
+            public_process_output(&stderr)
         ));
     }
     if stdout
@@ -1681,8 +1704,8 @@ pub async fn handle_pix_list_counters(args: ListCountersArgs) -> Result<Counters
     {
         return Err(anyhow::anyhow!(
             "pixtool failed to list counters.\nstdout: {}\nstderr: {}",
-            stdout,
-            stderr
+            public_process_output(&stdout),
+            public_process_output(&stderr)
         ));
     }
     let all: Vec<String> = stdout
@@ -1695,8 +1718,8 @@ pub async fn handle_pix_list_counters(args: ListCountersArgs) -> Result<Counters
         return Err(anyhow::anyhow!(
             "pixtool returned no counters (status: {}).\nstdout: {}\nstderr: {}",
             output.status,
-            stdout,
-            stderr
+            public_process_output(&stdout),
+            public_process_output(&stderr)
         ));
     }
 
@@ -1731,7 +1754,7 @@ pub async fn handle_pix_list_counters(args: ListCountersArgs) -> Result<Counters
         // pixtool analysis verbs can exit non-zero even on success; a parsed,
         // non-empty counter list is the success signal.
         success: true,
-        capture_path: args.capture_path,
+        capture_path: capture_path.to_string_lossy().into_owned(),
         total_count,
         returned: returned_list.len(),
         truncated,
@@ -1747,13 +1770,13 @@ pub async fn handle_pix_list_counters(args: ListCountersArgs) -> Result<Counters
 }
 
 pub async fn handle_pix_run_analysis(args: CapturePathArgs) -> Result<RunAnalysisReport> {
-    require_capture_file_async(args.capture_path.clone()).await?;
+    let capture_path = require_capture_file_async(args.capture_path.clone()).await?;
 
     let pixtool = PixTool::find()?;
     let mut command = Command::new(&pixtool);
     command
         .arg("open-capture")
-        .arg(&args.capture_path)
+        .arg(&capture_path)
         .arg("run-debug-layer");
     let output =
         run_pixtool_command(command, ANALYSIS_TIMEOUT, "pixtool debug-layer playback").await?;
@@ -1770,8 +1793,8 @@ pub async fn handle_pix_run_analysis(args: CapturePathArgs) -> Result<RunAnalysi
         return Err(anyhow::anyhow!(
             "pixtool debug-layer playback failed with status {}.\nstdout: {}\nstderr: {}",
             output.status,
-            stdout,
-            stderr
+            public_process_output(&stdout),
+            public_process_output(&stderr)
         ));
     }
 
@@ -1787,7 +1810,7 @@ pub async fn handle_pix_run_analysis(args: CapturePathArgs) -> Result<RunAnalysi
         // run-debug-layer "doesn't generate output but validates playback"; its
         // exit code is unreliable, so report based on detected issues instead.
         success: error_count == 0,
-        capture_path: args.capture_path,
+        capture_path: capture_path.to_string_lossy().into_owned(),
         analysis: AnalysisDetail {
             error_count,
             warning_count,
@@ -2027,12 +2050,12 @@ pub async fn analyze_frame_insights(
     capture_path: &str,
     include_counters: bool,
 ) -> Result<FrameInsights> {
-    require_capture_file_async(capture_path.to_string()).await?;
+    let capture_path = require_capture_file_async(capture_path.to_string()).await?;
 
     let csv = fresh_temp_path_async(".csv", None).await?;
     let pixtool = PixTool::find()?;
     let mut cmd = Command::new(&pixtool);
-    cmd.arg("open-capture").arg(capture_path);
+    cmd.arg("open-capture").arg(&capture_path);
     cmd.arg("save-event-list").arg(csv.as_os_str());
     if include_counters {
         push_value_option(&mut cmd, "--counters", "*")?;
@@ -2054,15 +2077,15 @@ pub async fn analyze_frame_insights(
             return Err(anyhow::anyhow!(
                 "pixtool did not produce a valid event list: {}\nstdout: {}\nstderr: {}",
                 error,
-                stdout,
-                stderr
+                public_process_output(&stdout),
+                public_process_output(&stderr)
             ));
         }
     };
 
     // The validated CSV is accepted after status and explicit diagnostics have
     // also been checked above.
-    let capture_path = capture_path.to_string();
+    let capture_path = capture_path.to_string_lossy().into_owned();
     tokio::task::spawn_blocking(move || frame_insights_from_csv(&capture_path, parsed))
         .await
         .context("Frame-insights processing task failed")?
