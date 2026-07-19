@@ -11,6 +11,7 @@ A Model Context Protocol (MCP) server that enables AI agents (GitHub Copilot, Cl
 - **Capture Analysis** - Extract event lists, counters, screenshots and validate replay with the D3D12 debug layer
 - **Structured results** - Every tool returns typed `structuredContent` with a JSON `outputSchema`
 - **Capture Management** - List and open capture files
+- **Guided workflows** - MCP prompts for rendering triage, frame profiling, and capture comparison
 
 ## Prerequisites
 
@@ -121,6 +122,8 @@ Add to `claude_desktop_config.json`:
 - **Elicitation** — when a tool requires a destination, a missing `output_path` is requested
   interactively if the client supports elicitation; otherwise a clear, model-correctable tool
   error is returned. (`pix_get_event_list` can omit it to receive inline rows.)
+- **Prompts and completion** — three user-controlled PIX workflows are exposed through MCP;
+  capture arguments and `capture://{id}` templates complete against the bounded capture catalog.
 - **Token-efficient** — `pix_get_event_list` paginates inline rows and can write the full list to
   CSV; `pix_list_captures` defaults to 100 rows (maximum 500), and `pix_list_counters` supports
   filtering and a bounded result limit.
@@ -220,6 +223,19 @@ advertise `resources.listChanged`.
 | `capture://{id}/events` | Hint to use the `pix_get_event_list` tool |
 | `capture://{id}/counters` | Hint to use the `pix_list_counters` tool |
 | `artifact://local/{id}` | Session-local output returned by a successful tool; small artifacts are readable and large/binary artifacts return bounded descriptors |
+
+## MCP Prompts
+
+| Prompt | Purpose |
+|--------|---------|
+| `debug_rendering_issue` | Verify PIX, capture a reproducible frame, and triage a visual defect |
+| `profile_frame` | Analyze an existing capture with bounded events and available counters |
+| `compare_captures` | Compare baseline and candidate captures without overstating single-frame evidence |
+
+`profile_frame.capture_id`, both capture arguments of `compare_captures`, and the `{id}` resource
+template argument support MCP completion. Suggestions are case-insensitive, context-aware (the
+other comparison capture is excluded), capped at 100 values, and only enumerate `.wpix` files from
+the server capture directory. Prompt and completion catalog scans share a bounded concurrency gate.
 
 ## Example Workflow
 

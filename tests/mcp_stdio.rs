@@ -1,4 +1,5 @@
 use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
@@ -15,12 +16,18 @@ struct McpSession {
 
 impl McpSession {
     fn spawn() -> Self {
-        Self::spawn_with_env(&[])
+        let directory = std::env::current_dir().expect("test working directory");
+        Self::spawn_in_with_env(&directory, &[])
     }
 
     fn spawn_with_env(environment: &[(&str, &str)]) -> Self {
+        let directory = std::env::current_dir().expect("test working directory");
+        Self::spawn_in_with_env(&directory, environment)
+    }
+
+    fn spawn_in_with_env(directory: &Path, environment: &[(&str, &str)]) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_pix-mcp"));
-        command.env("RUST_LOG", "error");
+        command.env("RUST_LOG", "error").current_dir(directory);
         for name in [
             "PIX_MCP_CAPTURES_DIR",
             "PIX_MCP_INPUT_ROOTS",
@@ -35,12 +42,11 @@ impl McpSession {
         for (name, value) in environment {
             command.env(name, value);
         }
-        let mut child = command
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("start pix-mcp test server");
+            .stderr(Stdio::null());
+        let mut child = command.spawn().expect("start pix-mcp test server");
         let stdin = child.stdin.take().expect("server stdin");
         let stdout = child.stdout.take().expect("server stdout");
         let (sender, messages) = mpsc::channel();
@@ -120,6 +126,311 @@ impl Drop for McpSession {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+#[test]
+fn stdio_prompts_and_capture_completion_are_available() {
+    let directory = tempfile::tempdir().expect("temporary capture directory");
+    std::fs::write(directory.path().join("Frame Alpha.wpix"), b"capture")
+        .expect("write capture fixture");
+    std::fs::write(directory.path().join("Frame Beta.wpix"), b"capture")
+        .expect("write second capture fixture");
+    for index in 0..105 {
+        std::fs::write(
+            directory.path().join(format!("Capture {index:03}.wpix")),
+            b"capture",
+        )
+        .expect("write completion pagination fixture");
+    }
+    std::fs::write(directory.path().join("ignored.txt"), b"not a capture")
+        .expect("write ignored fixture");
+
+    let captures_dir = directory.path().to_string_lossy().into_owned();
+    let mut session =
+        McpSession::spawn_with_env(&[("PIX_MCP_CAPTURES_DIR", captures_dir.as_str())]);
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "pix-mcp-prompt-test", "version": "1" }
+        }
+    }));
+    let initialize = session.receive();
+    assert!(initialize["result"]["capabilities"]["prompts"].is_object());
+    assert!(initialize["result"]["capabilities"]["completions"].is_object());
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+        "params": {}
+    }));
+
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "prompts/list",
+        "params": {}
+    }));
+    let listed = session.receive_until(|message| message["id"] == json!(2));
+    let names = listed["result"]["prompts"]
+        .as_array()
+        .expect("prompt array")
+        .iter()
+        .map(|prompt| prompt["name"].as_str().expect("prompt name"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec!["compare_captures", "debug_rendering_issue", "profile_frame"]
+    );
+
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "prompts/get",
+        "params": {
+            "name": "profile_frame",
+            "arguments": { "capture_id": "Alpha", "focus": "barriers" }
+        }
+    }));
+    let prompt = session.receive_until(|message| message["id"] == json!(3));
+    assert!(prompt.get("error").is_none(), "{prompt}");
+    assert!(
+        prompt["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("capture://Frame%20Alpha%2Ewpix/metadata")),
+        "{prompt}"
+    );
+
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "completion/complete",
+        "params": {
+            "ref": { "type": "ref/prompt", "name": "profile_frame" },
+            "argument": { "name": "capture_id", "value": "alpha" }
+        }
+    }));
+    let completion = session.receive_until(|message| message["id"] == json!(4));
+    assert_eq!(
+        completion["result"]["completion"]["values"],
+        json!(["Frame Alpha.wpix"]),
+        "{completion}"
+    );
+    assert_eq!(completion["result"]["completion"]["hasMore"], json!(false));
+
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "completion/complete",
+        "params": {
+            "ref": { "type": "ref/resource", "uri": "capture://{id}" },
+            "argument": { "name": "id", "value": "Alpha" }
+        }
+    }));
+    let resource_completion = session.receive_until(|message| message["id"] == json!(5));
+    assert_eq!(
+        resource_completion["result"]["completion"]["values"],
+        json!(["Frame Alpha.wpix"]),
+        "{resource_completion}"
+    );
+
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "prompts/list",
+        "params": { "cursor": "not-supported" }
+    }));
+    let cursor_error = session.receive_until(|message| message["id"] == json!(6));
+    assert_eq!(cursor_error["error"]["code"], json!(-32602));
+
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "completion/complete",
+        "params": {
+            "ref": { "type": "ref/prompt", "name": "compare_captures" },
+            "argument": { "name": "candidate_id", "value": "Frame" },
+            "context": { "arguments": { "baseline_id": "Alpha" } }
+        }
+    }));
+    let contextual_completion = session.receive_until(|message| message["id"] == json!(7));
+    assert_eq!(
+        contextual_completion["result"]["completion"]["values"],
+        json!(["Frame Beta.wpix"]),
+        "{contextual_completion}"
+    );
+
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 8,
+        "method": "completion/complete",
+        "params": {
+            "ref": { "type": "ref/prompt", "name": "missing_prompt" },
+            "argument": { "name": "capture_id", "value": "Frame" }
+        }
+    }));
+    let unknown_prompt = session.receive_until(|message| message["id"] == json!(8));
+    assert_eq!(unknown_prompt["error"]["code"], json!(-32602));
+
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "completion/complete",
+        "params": {
+            "ref": { "type": "ref/prompt", "name": "profile_frame" },
+            "argument": { "name": "unknown", "value": "Frame" }
+        }
+    }));
+    let unknown_argument = session.receive_until(|message| message["id"] == json!(9));
+    assert_eq!(unknown_argument["error"]["code"], json!(-32602));
+
+    let oversized_query_value = "x".repeat(257);
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "completion/complete",
+        "params": {
+            "ref": { "type": "ref/prompt", "name": "profile_frame" },
+            "argument": { "name": "capture_id", "value": oversized_query_value }
+        }
+    }));
+    let oversized_query = session.receive_until(|message| message["id"] == json!(10));
+    assert_eq!(oversized_query["error"]["code"], json!(-32602));
+
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 11,
+        "method": "prompts/get",
+        "params": {
+            "name": "profile_frame",
+            "arguments": { "capture_id": "missing", "focus": "barriers" }
+        }
+    }));
+    let missing_capture = session.receive_until(|message| message["id"] == json!(11));
+    assert_eq!(missing_capture["error"]["code"], json!(-32602));
+
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 12,
+        "method": "completion/complete",
+        "params": {
+            "ref": { "type": "ref/resource", "uri": "capture://{id}" },
+            "argument": { "name": "id", "value": "" }
+        }
+    }));
+    let bounded_completion = session.receive_until(|message| message["id"] == json!(12));
+    let values = bounded_completion["result"]["completion"]["values"]
+        .as_array()
+        .expect("completion values");
+    assert_eq!(values.len(), 100, "{bounded_completion}");
+    assert_eq!(
+        bounded_completion["result"]["completion"]["total"],
+        json!(107)
+    );
+    assert_eq!(
+        bounded_completion["result"]["completion"]["hasMore"],
+        json!(true)
+    );
+
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 13,
+        "method": "prompts/get",
+        "params": {
+            "name": "compare_captures",
+            "arguments": {
+                "baseline_id": "Alpha",
+                "candidate_id": "Frame Alpha.wpix",
+                "focus": "regression"
+            }
+        }
+    }));
+    let aliased_comparison = session.receive_until(|message| message["id"] == json!(13));
+    assert_eq!(aliased_comparison["error"]["code"], json!(-32602));
+
+    let oversized_focus = "x".repeat(8 * 1024 + 1);
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 14,
+        "method": "completion/complete",
+        "params": {
+            "ref": { "type": "ref/prompt", "name": "profile_frame" },
+            "argument": { "name": "focus", "value": oversized_focus }
+        }
+    }));
+    let oversized_non_catalog_value = session.receive_until(|message| message["id"] == json!(14));
+    assert_eq!(oversized_non_catalog_value["error"]["code"], json!(-32602));
+
+    let oversized_context_id = "x".repeat(1025);
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 15,
+        "method": "completion/complete",
+        "params": {
+            "ref": { "type": "ref/prompt", "name": "compare_captures" },
+            "argument": { "name": "candidate_id", "value": "Frame" },
+            "context": { "arguments": { "baseline_id": oversized_context_id } }
+        }
+    }));
+    let oversized_context = session.receive_until(|message| message["id"] == json!(15));
+    assert_eq!(oversized_context["error"]["code"], json!(-32602));
+
+    let oversized_reference = "p".repeat(129);
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 16,
+        "method": "completion/complete",
+        "params": {
+            "ref": { "type": "ref/prompt", "name": oversized_reference.clone() },
+            "argument": { "name": "capture_id", "value": "Frame" }
+        }
+    }));
+    let bounded_reference_error = session.receive_until(|message| message["id"] == json!(16));
+    assert_eq!(bounded_reference_error["error"]["code"], json!(-32602));
+    assert!(
+        !bounded_reference_error
+            .to_string()
+            .contains(&oversized_reference)
+    );
+}
+
+#[test]
+fn stdio_prompt_internal_errors_are_sanitized() {
+    let directory = tempfile::tempdir().expect("temporary capture directory");
+    let path = directory.path().to_path_buf();
+    let captures_dir = path.to_string_lossy().into_owned();
+    let mut session =
+        McpSession::spawn_with_env(&[("PIX_MCP_CAPTURES_DIR", captures_dir.as_str())]);
+    initialize(&mut session);
+
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "resources/list",
+        "params": {}
+    }));
+    let catalog = session.receive_until(|message| message["id"] == json!(2));
+    assert!(catalog.get("error").is_none(), "{catalog}");
+
+    std::fs::remove_dir_all(&path).expect("remove capture directory after policy initialization");
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "prompts/get",
+        "params": {
+            "name": "profile_frame",
+            "arguments": { "capture_id": "missing", "focus": "barriers" }
+        }
+    }));
+    let response = session.receive_until(|message| message["id"] == json!(3));
+    assert_eq!(response["error"]["code"], json!(-32603), "{response}");
+    assert_eq!(
+        response["error"]["message"],
+        json!("Could not validate the PIX capture for this prompt")
+    );
+    assert!(!response.to_string().contains(&captures_dir), "{response}");
 }
 
 #[test]
