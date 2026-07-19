@@ -468,6 +468,10 @@ fn output_path_elicitation(name: &str) -> Option<(&'static str, &'static str)> {
         "pix_gpu_capture_launch" => {
             Some(("exe_path", "Where should the GPU capture (.wpix) be saved?"))
         }
+        "pix_programmatic_capture" => Some((
+            "exe_path",
+            "Where should the programmatic GPU capture (.wpix) be saved?",
+        )),
         "pix_timing_capture" => Some((
             "process_id",
             "Where should the timing capture (.wpix) be saved?",
@@ -543,8 +547,8 @@ impl PixServer {
         name = "pix_launch",
         description = "Launch an executable under pixtool. NOTE: this returns pixtool's launcher \
                        PID, not the game's, and does not leave a process you can later GPU-capture \
-                       by PID. For a programmatic GPU capture use pix_gpu_capture_launch or \
-                       pix_capture_and_analyze (PIX can only capture a process it launched).",
+                       by PID. Use pix_gpu_capture_launch for the next presented frame or \
+                       pix_programmatic_capture for an application-selected region.",
         annotations(title = "Launch with PIX", destructive_hint = true)
     )]
     async fn pix_launch(
@@ -693,12 +697,60 @@ impl PixServer {
     }
 
     #[tool(
-        name = "pix_timing_capture",
-        description = "Take a timing capture of a running process (CPU/GPU timing). Requires \
-                       administrator privileges.",
-        annotations(title = "Timing capture (PID)", destructive_hint = true),
+        name = "pix_programmatic_capture",
+        description = "Launch a PIX-instrumented executable, wait for the application to trigger \
+                       one programmatic GPU capture, and save it as .wpix. This is the \
+                       deterministic choice when the application controls the exact frame or \
+                       region; it times out if the target never invokes the PIX capture API.",
+        annotations(title = "Programmatic GPU capture", destructive_hint = true),
         output_schema = rmcp::handler::server::tool::schema_for_output::<capture::CaptureReport>()
             .expect("CaptureReport must produce a valid object output schema"),
+    )]
+    async fn pix_programmatic_capture(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(mut args): Parameters<capture::ProgrammaticCaptureArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        args.output_path = Some(
+            match resolve_output_path(
+                &context,
+                args.output_path,
+                "Where should the programmatic GPU capture (.wpix) be saved?",
+            )
+            .await
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(error)]));
+                }
+            },
+        );
+        let result = with_progress(
+            &context,
+            "Waiting for programmatic PIX capture",
+            capture::handle_pix_programmatic_capture(args),
+        )
+        .await;
+        structured_call_result(result, |report| {
+            resources::local_artifact_resource(
+                &self.artifact_registry,
+                &report.output_path,
+                "PIX programmatic GPU capture",
+                "application/octet-stream",
+            )
+            .into_iter()
+            .collect()
+        })
+    }
+
+    #[tool(
+        name = "pix_timing_capture",
+        description = "Take a bounded timing capture of a running process. Select balanced, \
+                       cpu_detailed, gpu_only, or cpu_only, with explicit overrides for PIX's \
+                       documented sampling/callstack/GPU options. Requires administrator privileges.",
+        annotations(title = "Timing capture (PID)", destructive_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<capture::TimingCaptureReport>()
+            .expect("TimingCaptureReport must produce a valid object output schema"),
     )]
     async fn pix_timing_capture(
         &self,
@@ -973,8 +1025,9 @@ impl PixServer {
 
     #[tool(
         name = "pix_compare_captures",
-        description = "Compare two capture files' size and modification metadata. This does not \
-                       establish a performance regression; compare event timing for that.",
+        description = "Compare two GPU captures by exporting bounded event lists and reporting \
+                       sequence/count/column differences, plus optional GPU-counter aggregates. \
+                       Falls back explicitly to metadata when replay analysis is unavailable.",
         annotations(title = "Compare captures", read_only_hint = true)
     )]
     async fn pix_compare_captures(
@@ -1060,7 +1113,7 @@ impl ServerHandler for PixServer {
             .with_instructions(
                 "Microsoft PIX debugging tools for DirectX 12. Run pix_status first to verify \
                  setup. Use pix_capture_and_analyze for a one-shot launch+capture+triage, or \
-                 pix_gpu_capture_launch / pix_gpu_capture to record. Analyze with \
+                 pix_gpu_capture_launch / pix_programmatic_capture / pix_gpu_capture to record. Analyze with \
                  pix_analyze_frame (heuristic triage), pix_get_event_list (paginated), \
                  pix_get_screenshot (returns the frame as an image), pix_list_counters, and \
                  pix_run_analysis (playback validation only; pixtool does not export debug-layer \
@@ -1343,6 +1396,7 @@ mod tests {
             "pix_launch_and_capture",
             "pix_gpu_capture",
             "pix_gpu_capture_launch",
+            "pix_programmatic_capture",
             "pix_timing_capture",
             "pix_get_event_list",
             "pix_get_screenshot",

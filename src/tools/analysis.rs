@@ -1,7 +1,8 @@
 //! Analysis tool logic: parse captures, counters, comparisons, and frame
 //! insights via `pixtool.exe`.
 
-use std::io::{Read, Seek, SeekFrom};
+use std::collections::{BTreeMap, HashMap};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -64,6 +65,15 @@ const MAX_COUNTER_RESULT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SCREENSHOT_SOURCE_DIMENSION: u32 = 16_384;
 const MAX_SCREENSHOT_DECODE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_EMBEDDED_SCREENSHOT_BYTES: usize = 8 * 1024 * 1024;
+const COMPARE_DEFAULT_MAX_EVENTS: usize = 20_000;
+const COMPARE_MAX_EVENTS: usize = 50_000;
+const COMPARE_DEFAULT_MAX_CHANGES: usize = 20;
+const COMPARE_MAX_CHANGES: usize = 50;
+const MAX_COMPARE_COLUMNS: usize = 4_096;
+const MAX_COMPARE_HEADER_BYTES: usize = 512 * 1024;
+const MAX_COMPARE_EVENT_FIELD_BYTES: usize = 4 * 1024;
+const MAX_COMPARE_WARNING_BYTES: usize = 8 * 1024;
+const MAX_COMPARE_REPORT_BYTES: usize = 1024 * 1024;
 
 fn require_capture_file(raw_path: &str) -> Result<PathBuf> {
     if raw_path.trim().is_empty() {
@@ -666,6 +676,19 @@ pub struct CompareCapturesArgs {
     pub capture_a: String,
     /// Path to the second capture file (comparison).
     pub capture_b: String,
+    /// Include all available counters in each event export. This can make
+    /// replay substantially slower; structural comparison does not require it.
+    #[serde(default)]
+    pub include_counters: Option<bool>,
+    /// Maximum event rows retained from each capture for structural analysis.
+    /// The full CSV is still counted, so truncation is reported explicitly.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 50000))]
+    pub max_events: Option<usize>,
+    /// Maximum changed event kinds returned (default 20, maximum 50).
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 50))]
+    pub max_changes: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -803,11 +826,93 @@ pub struct ComparisonDetail {
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct EventCountChange {
+    pub queue_id: String,
+    pub event_name: String,
+    pub baseline_count: usize,
+    pub comparison_count: usize,
+    pub difference: i64,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct EventSequenceComparison {
+    pub compared_positions: usize,
+    pub exact_position_matches: usize,
+    pub exact_position_match_percent: String,
+    pub common_prefix_events: usize,
+    /// Only meaningful when neither retained event list was truncated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub common_suffix_events: Option<usize>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct EventColumnComparison {
+    pub added_count: usize,
+    pub removed_count: usize,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EventComparisonScope {
+    FullCapture,
+    Prefix,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct EventStructureComparison {
+    pub scope: EventComparisonScope,
+    pub baseline_total_events: usize,
+    pub comparison_total_events: usize,
+    pub total_event_difference: i64,
+    pub baseline_analyzed_events: usize,
+    pub comparison_analyzed_events: usize,
+    pub truncated: bool,
+    pub sequence: EventSequenceComparison,
+    pub columns: EventColumnComparison,
+    pub changed_event_kinds: usize,
+    pub changes_truncated: bool,
+    pub top_changes: Vec<EventCountChange>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct TimingAggregate {
+    pub samples: usize,
+    pub sum: f64,
+    pub mean: f64,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct GpuTimingComparison {
+    pub column: String,
+    pub baseline: TimingAggregate,
+    pub comparison: TimingAggregate,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sum_difference_percent: Option<String>,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CompareAnalysisMode {
+    EventStructure,
+    MetadataOnly,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct CompareReport {
     pub success: bool,
     pub capture_a: CaptureSide,
     pub capture_b: CaptureSide,
     pub comparison: ComparisonDetail,
+    pub analysis_mode: CompareAnalysisMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_structure: Option<EventStructureComparison>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_timing: Option<GpuTimingComparison>,
+    pub warnings: Vec<String>,
     pub suggestion: String,
 }
 
@@ -1058,63 +1163,590 @@ fn parse_json_counters(content: &str) -> Result<ExportCountersReport> {
 // Compare
 // ---------------------------------------------------------------------------
 
-pub async fn handle_pix_compare_captures(args: CompareCapturesArgs) -> Result<CompareReport> {
-    tokio::task::spawn_blocking(move || compare_captures(args))
-        .await
-        .context("Capture comparison task failed")?
+#[derive(Debug)]
+struct ComparisonCsv {
+    headers: StringRecord,
+    events: Vec<ComparisonEvent>,
+    total_events: usize,
+    gpu_duration_column: Option<String>,
 }
 
-fn compare_captures(args: CompareCapturesArgs) -> Result<CompareReport> {
-    let path_a = require_capture_file(&args.capture_a)
-        .with_context(|| format!("Invalid baseline capture: {}", args.capture_a))?;
-    let path_b = require_capture_file(&args.capture_b)
-        .with_context(|| format!("Invalid comparison capture: {}", args.capture_b))?;
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EventIdentity {
+    queue_id: String,
+    name: String,
+}
 
-    let meta_a = std::fs::metadata(&path_a)?;
-    let meta_b = std::fs::metadata(&path_b)?;
+#[derive(Debug)]
+struct ComparisonEvent {
+    identity: EventIdentity,
+    gpu_duration: Option<f64>,
+}
 
-    let size_a = meta_a.len();
-    let size_b = meta_b.len();
+fn parse_comparison_csv_reader(reader: impl Read, max_events: usize) -> Result<ComparisonCsv> {
+    let mut reader = ReaderBuilder::new().flexible(false).from_reader(reader);
+    let headers = reader
+        .headers()
+        .context("Invalid event-list CSV header")?
+        .clone();
+    validate_event_list_headers(&headers)?;
+    if headers.len() > MAX_COMPARE_COLUMNS
+        || headers.as_slice().len() > MAX_COMPARE_HEADER_BYTES
+        || headers
+            .iter()
+            .any(|header| header.len() > MAX_COMPARE_EVENT_FIELD_BYTES)
+    {
+        return Err(anyhow::anyhow!(
+            "Event-list header exceeds comparison limits ({} columns, {} total bytes, {} bytes per column)",
+            MAX_COMPARE_COLUMNS,
+            MAX_COMPARE_HEADER_BYTES,
+            MAX_COMPARE_EVENT_FIELD_BYTES,
+        ));
+    }
+    let queue_column = event_column(&headers, "Queue ID")?;
+    let name_column = event_column(&headers, "Name")?;
+    let gpu_duration = gpu_duration_column(&headers);
+
+    let mut events = Vec::with_capacity(max_events.min(4_096));
+    let mut total_events = 0usize;
+    for record in reader.records() {
+        if total_events >= MAX_ANALYSIS_CSV_ROWS {
+            return Err(anyhow::anyhow!(
+                "Event-list CSV contains more than the supported maximum of {} rows",
+                MAX_ANALYSIS_CSV_ROWS
+            ));
+        }
+        let record = record.with_context(|| {
+            format!("Invalid event-list CSV record at row {}", total_events + 1)
+        })?;
+        total_events += 1;
+        if events.len() < max_events {
+            let queue_id = record.get(queue_column).unwrap_or_default().trim();
+            let name = record.get(name_column).unwrap_or_default().trim();
+            if queue_id.len() > MAX_COMPARE_EVENT_FIELD_BYTES
+                || name.len() > MAX_COMPARE_EVENT_FIELD_BYTES
+            {
+                return Err(anyhow::anyhow!(
+                    "Event {} contains a queue/name field larger than the comparison limit of {} bytes",
+                    total_events,
+                    MAX_COMPARE_EVENT_FIELD_BYTES
+                ));
+            }
+            let duration = gpu_duration
+                .as_ref()
+                .and_then(|(index, _)| record.get(*index))
+                .and_then(|value| value.trim().parse::<f64>().ok())
+                .filter(|value| value.is_finite());
+            events.push(ComparisonEvent {
+                identity: EventIdentity {
+                    queue_id: queue_id.to_string(),
+                    name: name.to_string(),
+                },
+                gpu_duration: duration,
+            });
+        }
+    }
+    if total_events == 0 {
+        return Err(anyhow::anyhow!("Event-list CSV contains no events"));
+    }
+    Ok(ComparisonCsv {
+        headers,
+        events,
+        total_events,
+        gpu_duration_column: gpu_duration.map(|(_, name)| name),
+    })
+}
+
+#[cfg(test)]
+fn parse_comparison_csv_bytes(bytes: &[u8], max_events: usize) -> Result<ComparisonCsv> {
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    if bytes.is_empty() {
+        return Err(anyhow::anyhow!("Empty event-list CSV"));
+    }
+    parse_comparison_csv_reader(bytes, max_events)
+}
+
+fn read_comparison_csv(path: &Path, max_events: usize) -> Result<ComparisonCsv> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("Cannot inspect comparison event list: {}", path.display()))?;
+    if metadata.len() == 0 {
+        return Err(anyhow::anyhow!("Empty event-list CSV"));
+    }
+    if metadata.len() > MAX_ANALYSIS_CSV_BYTES {
+        return Err(anyhow::anyhow!(
+            "Comparison event list exceeds the {} byte limit",
+            MAX_ANALYSIS_CSV_BYTES
+        ));
+    }
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("Cannot open comparison event list: {}", path.display()))?;
+    let mut prefix = [0u8; 3];
+    let read = file
+        .read(&mut prefix)
+        .context("Could not inspect comparison CSV prefix")?;
+    let start = if read == prefix.len() && prefix == [0xEF, 0xBB, 0xBF] {
+        3
+    } else {
+        0
+    };
+    file.seek(SeekFrom::Start(start))
+        .context("Could not rewind comparison CSV")?;
+    parse_comparison_csv_reader(BufReader::new(file), max_events)
+}
+
+async fn export_comparison_events(
+    capture_path: PathBuf,
+    max_events: usize,
+    include_counters: bool,
+) -> Result<ComparisonCsv> {
+    let csv = fresh_temp_path_async(".csv", None).await?;
+    let pixtool = PixTool::find()?;
+    let mut command = Command::new(pixtool);
+    command
+        .arg("open-capture")
+        .arg(&capture_path)
+        .arg("save-event-list")
+        .arg(csv.as_os_str());
+    if include_counters {
+        push_value_option(&mut command, "--counters", "*")?;
+    }
+    let output =
+        run_pixtool_command(command, ANALYSIS_TIMEOUT, "pixtool capture comparison").await?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    validate_artifact_command_output(
+        output.status.success(),
+        output.status.code(),
+        &stdout,
+        &stderr,
+        "capture comparison",
+    )?;
+    let csv_path = csv.to_path_buf();
+    tokio::task::spawn_blocking(move || read_comparison_csv(&csv_path, max_events))
+        .await
+        .context("Comparison event-list parsing task failed")?
+}
+
+fn event_column(headers: &StringRecord, expected: &str) -> Result<usize> {
+    headers
+        .iter()
+        .position(|header| header.trim().eq_ignore_ascii_case(expected))
+        .ok_or_else(|| anyhow::anyhow!("PIX event list is missing the {expected:?} column"))
+}
+
+fn event_identities(csv: &ComparisonCsv) -> Vec<EventIdentity> {
+    csv.events
+        .iter()
+        .map(|event| event.identity.clone())
+        .collect()
+}
+
+fn compare_columns(a: &StringRecord, b: &StringRecord) -> EventColumnComparison {
+    const MAX_RETURNED_COLUMNS: usize = 50;
+    let normalize = |headers: &StringRecord| {
+        headers
+            .iter()
+            .map(|header| {
+                (
+                    header.trim().to_ascii_lowercase(),
+                    header.trim().to_string(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let a = normalize(a);
+    let b = normalize(b);
+    let all_added = b
+        .iter()
+        .filter(|(normalized, _)| !a.contains_key(*normalized))
+        .map(|(_, display)| display.clone())
+        .collect::<Vec<_>>();
+    let all_removed = a
+        .iter()
+        .filter(|(normalized, _)| !b.contains_key(*normalized))
+        .map(|(_, display)| display.clone())
+        .collect::<Vec<_>>();
+    EventColumnComparison {
+        added_count: all_added.len(),
+        removed_count: all_removed.len(),
+        added: all_added
+            .iter()
+            .take(MAX_RETURNED_COLUMNS)
+            .cloned()
+            .collect(),
+        removed: all_removed
+            .iter()
+            .take(MAX_RETURNED_COLUMNS)
+            .cloned()
+            .collect(),
+        truncated: all_added.len() > MAX_RETURNED_COLUMNS
+            || all_removed.len() > MAX_RETURNED_COLUMNS,
+    }
+}
+
+fn gpu_duration_column(headers: &StringRecord) -> Option<(usize, String)> {
+    headers.iter().enumerate().find_map(|(index, header)| {
+        let normalized = header.trim().to_ascii_lowercase();
+        let recognized = ["gpu duration", "gpu time"].iter().any(|base| {
+            normalized == *base
+                || normalized.strip_prefix(base).is_some_and(|suffix| {
+                    let suffix = suffix.trim_start();
+                    suffix.starts_with('(') || suffix.starts_with('[')
+                })
+        });
+        recognized.then(|| (index, header.trim().to_string()))
+    })
+}
+
+fn timing_aggregate(csv: &ComparisonCsv) -> Option<TimingAggregate> {
+    let mut samples = 0usize;
+    let mut sum = 0.0f64;
+    for event in &csv.events {
+        if let Some(value) = event.gpu_duration {
+            samples += 1;
+            sum += value;
+        }
+    }
+    (samples > 0 && sum.is_finite()).then(|| TimingAggregate {
+        samples,
+        sum,
+        mean: sum / samples as f64,
+    })
+}
+
+fn compare_gpu_timing(a: &ComparisonCsv, b: &ComparisonCsv) -> Option<GpuTimingComparison> {
+    if a.events.len() != a.total_events || b.events.len() != b.total_events {
+        return None;
+    }
+    let name = a.gpu_duration_column.as_ref()?;
+    if !b
+        .gpu_duration_column
+        .as_ref()
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
+    {
+        return None;
+    }
+    let baseline = timing_aggregate(a)?;
+    let comparison = timing_aggregate(b)?;
+    let sum_difference_percent = (baseline.sum != 0.0).then(|| {
+        format!(
+            "{:.2}%",
+            ((comparison.sum - baseline.sum) / baseline.sum) * 100.0
+        )
+    });
+    Some(GpuTimingComparison {
+        column: name.clone(),
+        baseline,
+        comparison,
+        sum_difference_percent,
+        note: "This is an aggregate of complete event exports using the same recognized GPU duration column. Nested PIX events can overlap or double-count time, so it is a triage signal rather than a frame-time verdict."
+            .to_string(),
+    })
+}
+
+fn build_event_structure_comparison(
+    a: &ComparisonCsv,
+    b: &ComparisonCsv,
+    max_changes: usize,
+) -> Result<EventStructureComparison> {
+    let events_a = event_identities(a);
+    let events_b = event_identities(b);
+    let truncated = a.events.len() < a.total_events || b.events.len() < b.total_events;
+    let compared_positions = events_a.len().min(events_b.len());
+    let exact_position_matches = events_a
+        .iter()
+        .zip(&events_b)
+        .filter(|(left, right)| left == right)
+        .count();
+    let common_prefix_events = events_a
+        .iter()
+        .zip(&events_b)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let common_suffix_events = (!truncated).then(|| {
+        events_a
+            .iter()
+            .rev()
+            .zip(events_b.iter().rev())
+            .take(compared_positions.saturating_sub(common_prefix_events))
+            .take_while(|(left, right)| left == right)
+            .count()
+    });
+
+    let mut counts = HashMap::<EventIdentity, (usize, usize)>::new();
+    for event in events_a {
+        counts.entry(event).or_default().0 += 1;
+    }
+    for event in events_b {
+        counts.entry(event).or_default().1 += 1;
+    }
+    let mut changes = counts
+        .into_iter()
+        .filter(|(_, (baseline, comparison))| baseline != comparison)
+        .map(
+            |(event, (baseline_count, comparison_count))| EventCountChange {
+                queue_id: event.queue_id,
+                event_name: event.name,
+                baseline_count,
+                comparison_count,
+                difference: comparison_count as i64 - baseline_count as i64,
+            },
+        )
+        .collect::<Vec<_>>();
+    changes.sort_by(|left, right| {
+        right
+            .difference
+            .unsigned_abs()
+            .cmp(&left.difference.unsigned_abs())
+            .then_with(|| left.queue_id.cmp(&right.queue_id))
+            .then_with(|| left.event_name.cmp(&right.event_name))
+    });
+    let changed_event_kinds = changes.len();
+    changes.truncate(max_changes);
+
+    Ok(EventStructureComparison {
+        scope: if truncated {
+            EventComparisonScope::Prefix
+        } else {
+            EventComparisonScope::FullCapture
+        },
+        baseline_total_events: a.total_events,
+        comparison_total_events: b.total_events,
+        total_event_difference: b.total_events as i64 - a.total_events as i64,
+        baseline_analyzed_events: a.events.len(),
+        comparison_analyzed_events: b.events.len(),
+        truncated,
+        sequence: EventSequenceComparison {
+            compared_positions,
+            exact_position_matches,
+            exact_position_match_percent: if compared_positions == 0 {
+                "0.00%".to_string()
+            } else {
+                format!(
+                    "{:.2}%",
+                    exact_position_matches as f64 / compared_positions as f64 * 100.0
+                )
+            },
+            common_prefix_events,
+            common_suffix_events,
+        },
+        columns: compare_columns(&a.headers, &b.headers),
+        changed_event_kinds,
+        changes_truncated: changed_event_kinds > changes.len(),
+        top_changes: changes,
+    })
+}
+
+fn metadata_comparison(size_a: u64, size_b: u64) -> ComparisonDetail {
     let size_diff_exact = i128::from(size_b) - i128::from(size_a);
-    let size_diff = size_diff_exact.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
-    let size_diff_percent = if size_a > 0 {
+    let size_difference_bytes =
+        size_diff_exact.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+    let size_difference_percent = if size_a > 0 {
         (size_diff_exact as f64 / size_a as f64) * 100.0
     } else {
         0.0
     };
-
-    let to_secs = |t: std::time::SystemTime| {
-        t.duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    };
-
-    Ok(CompareReport {
-        success: true,
-        capture_a: CaptureSide {
-            path: path_a.to_string_lossy().into_owned(),
-            size_bytes: size_a,
-            modified: meta_a.modified().ok().map(to_secs),
-        },
-        capture_b: CaptureSide {
-            path: path_b.to_string_lossy().into_owned(),
-            size_bytes: size_b,
-            modified: meta_b.modified().ok().map(to_secs),
-        },
-        comparison: ComparisonDetail {
-            size_difference_bytes: size_diff,
-            size_difference_percent: format!("{:.2}%", size_diff_percent),
-            size_increased: size_diff > 0,
-            note: if size_diff_exact.abs() > (i128::from(size_a) / 10) {
-                "Capture file sizes differ by more than 10%; file size alone does not establish a performance regression"
-                    .to_string()
-            } else {
-                "Capture file sizes are within 10%; this is metadata only, not a performance comparison"
-                    .to_string()
-            },
-        },
-        suggestion: "Compare event lists and the same GPU timing counters from both captures for regression analysis"
+    ComparisonDetail {
+        size_difference_bytes,
+        size_difference_percent: format!("{size_difference_percent:.2}%"),
+        size_increased: size_difference_bytes > 0,
+        note: "File size is retained as context only; event structure and like-for-like counters are the meaningful comparison signals."
             .to_string(),
+    }
+}
+
+fn capture_side(path: String, metadata: &std::fs::Metadata) -> CaptureSide {
+    CaptureSide {
+        path,
+        size_bytes: metadata.len(),
+        modified: metadata.modified().ok().map(|time| {
+            time.duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0)
+        }),
+    }
+}
+
+fn bounded_compare_warning(prefix: &str, error: &anyhow::Error) -> String {
+    let warning = format!("{prefix}: {error}");
+    truncate_utf8(&warning, MAX_COMPARE_WARNING_BYTES).0
+}
+
+fn fit_compare_report(mut report: CompareReport) -> Result<CompareReport> {
+    loop {
+        if serde_json::to_vec(&report)?.len() <= MAX_COMPARE_REPORT_BYTES {
+            return Ok(report);
+        }
+        if let Some(structure) = report.event_structure.as_mut() {
+            if structure.top_changes.pop().is_some() {
+                structure.changes_truncated = true;
+                continue;
+            }
+            if structure.columns.added.pop().is_some() || structure.columns.removed.pop().is_some()
+            {
+                structure.columns.truncated = true;
+                continue;
+            }
+        }
+        if report.gpu_timing.take().is_some() {
+            report.warnings.push(
+                "GPU timing aggregate was omitted to keep the comparison response within 1 MiB."
+                    .to_string(),
+            );
+            continue;
+        }
+        return Err(anyhow::anyhow!(
+            "Capture comparison exceeded its {} byte inline response budget",
+            MAX_COMPARE_REPORT_BYTES
+        ));
+    }
+}
+
+pub async fn handle_pix_compare_captures(args: CompareCapturesArgs) -> Result<CompareReport> {
+    let max_events = args.max_events.unwrap_or(COMPARE_DEFAULT_MAX_EVENTS);
+    if !(1..=COMPARE_MAX_EVENTS).contains(&max_events) {
+        return Err(anyhow::anyhow!(
+            "max_events must be between 1 and {COMPARE_MAX_EVENTS}"
+        ));
+    }
+    let max_changes = args.max_changes.unwrap_or(COMPARE_DEFAULT_MAX_CHANGES);
+    if !(1..=COMPARE_MAX_CHANGES).contains(&max_changes) {
+        return Err(anyhow::anyhow!(
+            "max_changes must be between 1 and {COMPARE_MAX_CHANGES}"
+        ));
+    }
+    let include_counters = args.include_counters.unwrap_or(false);
+
+    let (path_a, path_b) = tokio::try_join!(
+        require_capture_file_async(args.capture_a.clone()),
+        require_capture_file_async(args.capture_b.clone())
+    )?;
+    if path_a == path_b {
+        return Err(anyhow::anyhow!(
+            "capture_a and capture_b must identify different capture files"
+        ));
+    }
+    let metadata_a = std::fs::metadata(&path_a)?;
+    let metadata_b = std::fs::metadata(&path_b)?;
+    let comparison = metadata_comparison(metadata_a.len(), metadata_b.len());
+    let capture_a = capture_side(args.capture_a, &metadata_a);
+    let capture_b = capture_side(args.capture_b, &metadata_b);
+
+    let mut warnings = Vec::new();
+    let (events_a, events_b, counters_available) = if include_counters {
+        // Counter replay is deliberately serialized: replaying two captures on
+        // the same GPU at once can contaminate measurements and monopolize the
+        // complete pixtool foreground pool.
+        let counter_a = export_comparison_events(path_a.clone(), max_events, true).await;
+        let counter_b = export_comparison_events(path_b.clone(), max_events, true).await;
+        match (counter_a, counter_b) {
+            (Ok(events_a), Ok(events_b)) => (Ok(events_a), Ok(events_b), true),
+            (counter_a, counter_b) => {
+                if let Err(error) = &counter_a {
+                    warnings.push(bounded_compare_warning(
+                        "Baseline counter export failed",
+                        error,
+                    ));
+                }
+                if let Err(error) = &counter_b {
+                    warnings.push(bounded_compare_warning(
+                        "Comparison counter export failed",
+                        error,
+                    ));
+                }
+                warnings.push(
+                    "Retrying both event exports without counters so structural comparison remains available."
+                        .to_string(),
+                );
+                let (events_a, events_b) = tokio::join!(
+                    export_comparison_events(path_a, max_events, false),
+                    export_comparison_events(path_b, max_events, false)
+                );
+                (events_a, events_b, false)
+            }
+        }
+    } else {
+        let (events_a, events_b) = tokio::join!(
+            export_comparison_events(path_a, max_events, false),
+            export_comparison_events(path_b, max_events, false)
+        );
+        (events_a, events_b, false)
+    };
+    let mut event_structure = None;
+    let mut gpu_timing = None;
+
+    match (events_a, events_b) {
+        (Ok(events_a), Ok(events_b)) => {
+            match build_event_structure_comparison(&events_a, &events_b, max_changes) {
+                Ok(structure) => {
+                    if structure.truncated {
+                        warnings.push(format!(
+                            "Structural counts and sequence matching are limited to the first {max_events} events of each capture; total event counts cover the full bounded CSV exports."
+                        ));
+                    }
+                    event_structure = Some(structure);
+                    if counters_available {
+                        gpu_timing = compare_gpu_timing(&events_a, &events_b);
+                    }
+                    if include_counters && counters_available && gpu_timing.is_none() {
+                        warnings.push(
+                            "Counters were exported, but no timing aggregate is reported: a complete event set and the same recognized numeric GPU Duration/GPU Time column are required."
+                                .to_string(),
+                        );
+                    } else if include_counters && !counters_available {
+                        warnings.push(
+                            "GPU timing comparison is unavailable because counter export failed; structural results come from the counter-free retry."
+                                .to_string(),
+                        );
+                    }
+                }
+                Err(error) => warnings.push(bounded_compare_warning(
+                    "Event exports succeeded but structural comparison was unavailable",
+                    &error,
+                )),
+            }
+        }
+        (Err(error_a), Err(error_b)) => {
+            warnings.push(bounded_compare_warning(
+                "Baseline event export failed",
+                &error_a,
+            ));
+            warnings.push(bounded_compare_warning(
+                "Comparison event export failed",
+                &error_b,
+            ));
+        }
+        (Err(error), Ok(_)) => warnings.push(bounded_compare_warning(
+            "Baseline event export failed",
+            &error,
+        )),
+        (Ok(_), Err(error)) => warnings.push(bounded_compare_warning(
+            "Comparison event export failed",
+            &error,
+        )),
+    }
+
+    let analysis_mode = if event_structure.is_some() {
+        CompareAnalysisMode::EventStructure
+    } else {
+        CompareAnalysisMode::MetadataOnly
+    };
+    fit_compare_report(CompareReport {
+        success: true,
+        capture_a,
+        capture_b,
+        comparison,
+        analysis_mode,
+        event_structure,
+        gpu_timing,
+        warnings,
+        suggestion: if analysis_mode == CompareAnalysisMode::EventStructure {
+            "Use top_changes to locate added/removed work. Treat GPU timing aggregates as triage only, then verify the same marker/counter range in PIX."
+                .to_string()
+        } else {
+            "Only metadata could be compared. Enable Windows Developer Mode, verify capture replay compatibility, and retry event export."
+                .to_string()
+        },
     })
 }
 
@@ -2102,6 +2734,160 @@ fn capture_not_found(path: &str) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn structural_comparison_detects_insertions_without_global_id_noise() {
+        let baseline = parse_comparison_csv_bytes(
+            concat!(
+                "Queue ID,Name,Global ID,GPU Duration\n",
+                "0,Begin,1,1\n",
+                "0,Draw A,2,2\n",
+                "0,Draw A,3,3\n",
+                "0,End,4,4\n"
+            )
+            .as_bytes(),
+            100,
+        )
+        .expect("baseline CSV");
+        let comparison = parse_comparison_csv_bytes(
+            concat!(
+                "Queue ID,Name,Global ID,GPU Duration\n",
+                "0,Begin,101,1\n",
+                "0,Draw A,102,2\n",
+                "0,Dispatch,103,5\n",
+                "0,Draw A,104,3\n",
+                "0,End,105,4\n"
+            )
+            .as_bytes(),
+            100,
+        )
+        .expect("comparison CSV");
+
+        let structure = build_event_structure_comparison(&baseline, &comparison, 20)
+            .expect("structural comparison");
+        assert_eq!(structure.scope, EventComparisonScope::FullCapture);
+        assert_eq!(structure.total_event_difference, 1);
+        assert_eq!(structure.sequence.common_prefix_events, 2);
+        assert_eq!(structure.changed_event_kinds, 1);
+        assert_eq!(structure.top_changes[0].event_name, "Dispatch");
+        assert_eq!(structure.top_changes[0].difference, 1);
+
+        let timing = compare_gpu_timing(&baseline, &comparison).expect("timing aggregate");
+        assert_eq!(timing.baseline.sum, 10.0);
+        assert_eq!(timing.comparison.sum, 15.0);
+        assert_eq!(timing.sum_difference_percent.as_deref(), Some("50.00%"));
+    }
+
+    #[test]
+    fn structural_comparison_reports_prefix_scope_when_event_bound_is_hit() {
+        let csv = concat!(
+            "Queue ID,Name,Global ID,GPU Duration\n",
+            "0,Begin,1,1\n",
+            "0,Draw,2,2\n",
+            "0,End,3,3\n"
+        );
+        let baseline = parse_comparison_csv_bytes(csv.as_bytes(), 2).expect("bounded CSV");
+        let comparison = parse_comparison_csv_bytes(csv.as_bytes(), 2).expect("bounded CSV");
+        let structure = build_event_structure_comparison(&baseline, &comparison, 20)
+            .expect("structural comparison");
+        assert_eq!(structure.scope, EventComparisonScope::Prefix);
+        assert!(structure.truncated);
+        assert_eq!(structure.baseline_total_events, 3);
+        assert_eq!(structure.baseline_analyzed_events, 2);
+        assert_eq!(structure.sequence.common_suffix_events, None);
+        assert!(compare_gpu_timing(&baseline, &comparison).is_none());
+    }
+
+    #[test]
+    fn comparison_does_not_treat_gpu_timestamps_as_durations() {
+        let csv = concat!(
+            "Queue ID,Name,Global ID,GPU Start Time\n",
+            "0,Begin,1,1000000\n",
+            "0,End,2,2000000\n"
+        );
+        let baseline = parse_comparison_csv_bytes(csv.as_bytes(), 10).expect("baseline CSV");
+        let comparison = parse_comparison_csv_bytes(csv.as_bytes(), 10).expect("comparison CSV");
+        assert!(compare_gpu_timing(&baseline, &comparison).is_none());
+    }
+
+    #[test]
+    fn comparison_file_parser_streams_and_handles_utf8_bom() {
+        let directory = tempfile::tempdir().expect("comparison directory");
+        let csv_path = directory.path().join("events.csv");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"Queue ID,Name,Global ID,GPU Duration (ns)\n0,Draw,1,42\n");
+        std::fs::write(&csv_path, bytes).expect("write comparison CSV");
+
+        let parsed = read_comparison_csv(&csv_path, 10).expect("stream comparison CSV");
+        assert_eq!(parsed.total_events, 1);
+        assert_eq!(parsed.events.len(), 1);
+        assert_eq!(parsed.events[0].identity.name, "Draw");
+        assert_eq!(parsed.events[0].gpu_duration, Some(42.0));
+    }
+
+    #[test]
+    fn comparison_report_trims_pathological_fields_to_inline_budget() {
+        let pathological_name = "\u{1}".repeat(MAX_COMPARE_EVENT_FIELD_BYTES);
+        let top_changes = (0..COMPARE_MAX_CHANGES)
+            .map(|index| EventCountChange {
+                queue_id: "0".to_string(),
+                event_name: format!("{pathological_name}{index}"),
+                baseline_count: 0,
+                comparison_count: 1,
+                difference: 1,
+            })
+            .collect();
+        let report = CompareReport {
+            success: true,
+            capture_a: CaptureSide {
+                path: "a.wpix".to_string(),
+                size_bytes: 1,
+                modified: None,
+            },
+            capture_b: CaptureSide {
+                path: "b.wpix".to_string(),
+                size_bytes: 1,
+                modified: None,
+            },
+            comparison: metadata_comparison(1, 1),
+            analysis_mode: CompareAnalysisMode::EventStructure,
+            event_structure: Some(EventStructureComparison {
+                scope: EventComparisonScope::FullCapture,
+                baseline_total_events: 1,
+                comparison_total_events: 1,
+                total_event_difference: 0,
+                baseline_analyzed_events: 1,
+                comparison_analyzed_events: 1,
+                truncated: false,
+                sequence: EventSequenceComparison {
+                    compared_positions: 1,
+                    exact_position_matches: 1,
+                    exact_position_match_percent: "100.00%".to_string(),
+                    common_prefix_events: 1,
+                    common_suffix_events: Some(0),
+                },
+                columns: EventColumnComparison {
+                    added_count: 0,
+                    removed_count: 0,
+                    added: Vec::new(),
+                    removed: Vec::new(),
+                    truncated: false,
+                },
+                changed_event_kinds: COMPARE_MAX_CHANGES,
+                changes_truncated: false,
+                top_changes,
+            }),
+            gpu_timing: None,
+            warnings: Vec::new(),
+            suggestion: "Inspect changes".to_string(),
+        };
+
+        let fitted = fit_compare_report(report).expect("fit comparison report");
+        assert!(serde_json::to_vec(&fitted).unwrap().len() <= MAX_COMPARE_REPORT_BYTES);
+        let structure = fitted.event_structure.expect("event structure");
+        assert!(structure.changes_truncated);
+        assert!(structure.top_changes.len() < COMPARE_MAX_CHANGES);
+    }
 
     #[test]
     fn test_encode_thumbnail_downscales_and_is_valid_png() {

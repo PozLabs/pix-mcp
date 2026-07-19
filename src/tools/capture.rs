@@ -14,7 +14,7 @@ use anyhow::Result;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
-use crate::pix::PixTool;
+use crate::pix::{PixTool, pixtool::TimingCaptureOptions};
 use crate::security;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -50,6 +50,43 @@ pub struct GpuCaptureLaunchArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ProgrammaticCaptureArgs {
+    /// Path to an executable instrumented to trigger a PIX programmatic capture.
+    pub exe_path: String,
+    /// Command line arguments to pass to the executable.
+    #[serde(default)]
+    pub args: Option<Vec<String>>,
+    /// Path to save the single programmatic capture (.wpix extension).
+    #[serde(default)]
+    pub output_path: Option<String>,
+    /// Working directory for the executable.
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    /// Maximum time to wait for the application's capture trigger. Defaults to
+    /// 600 seconds; range 1..=1800. Timeout terminates the managed process tree.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 1800))]
+    pub timeout_seconds: Option<u32>,
+}
+
+/// Documented timing-capture profiles. Individual fields on
+/// [`TimingCaptureArgs`] can override a profile.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TimingCapturePreset {
+    /// PIX defaults: CPU samples/callstacks and GPU timings at 1000 samples/s.
+    #[default]
+    Balanced,
+    /// Maximum documented CPU sampling rate with callstacks and GPU timings.
+    CpuDetailed,
+    /// GPU timings without CPU samples or context-switch callstacks.
+    GpuOnly,
+    /// CPU samples/callstacks without GPU timings.
+    CpuOnly,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TimingCaptureArgs {
     /// Process ID (PID) of the running application to capture.
     #[schemars(range(min = 1))]
@@ -61,6 +98,22 @@ pub struct TimingCaptureArgs {
     #[serde(default)]
     #[schemars(range(min = 1, max = 600000))]
     pub duration_ms: Option<u32>,
+    /// Capture profile (default: balanced). Explicit options below override it.
+    #[serde(default)]
+    pub preset: Option<TimingCapturePreset>,
+    /// CPU samples per second (1..=8000). Has no meaning when CPU samples are disabled.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 8000))]
+    pub sample_rate: Option<u32>,
+    /// Include CPU samples. Defaults according to the selected preset.
+    #[serde(default)]
+    pub include_cpu_samples: Option<bool>,
+    /// Include context-switch callstacks. Defaults according to the selected preset.
+    #[serde(default)]
+    pub include_callstacks: Option<bool>,
+    /// Include GPU timings. Defaults according to the selected preset.
+    #[serde(default)]
+    pub include_gpu_timings: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -94,6 +147,28 @@ pub struct CaptureReport {
     pub pixtool_output: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct TimingCaptureSettingsReport {
+    pub preset: TimingCapturePreset,
+    pub duration_ms: u32,
+    /// Effective rate, including PIX's documented 1000 samples/s default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_rate: Option<u32>,
+    pub cpu_samples: bool,
+    pub callstacks: bool,
+    pub gpu_timings: bool,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct TimingCaptureReport {
+    pub success: bool,
+    pub message: String,
+    pub output_path: String,
+    pub pixtool_output: String,
+    pub note: String,
+    pub settings: TimingCaptureSettingsReport,
 }
 
 /// A single capture file entry.
@@ -200,17 +275,86 @@ pub async fn handle_pix_gpu_capture_launch(args: GpuCaptureLaunchArgs) -> Result
     })
 }
 
-pub async fn handle_pix_timing_capture(args: TimingCaptureArgs) -> Result<CaptureReport> {
+pub async fn handle_pix_programmatic_capture(
+    args: ProgrammaticCaptureArgs,
+) -> Result<CaptureReport> {
+    let exe_path = PathBuf::from(&args.exe_path);
     let output_path = require_output_path(args.output_path)?;
-    let result =
-        PixTool::timing_capture_process(args.process_id, &output_path, args.duration_ms).await?;
+    let cmd_args = args.args.unwrap_or_default();
+    let cmd_args_ref: Vec<&str> = cmd_args.iter().map(String::as_str).collect();
+    let working_dir = args.working_dir.map(PathBuf::from);
+
+    let result = PixTool::programmatic_capture_launch(
+        &exe_path,
+        &cmd_args_ref,
+        &output_path,
+        working_dir.as_deref(),
+        args.timeout_seconds,
+    )
+    .await?;
 
     Ok(CaptureReport {
         success: true,
         message: result.message,
         output_path: result.output_path.to_string_lossy().to_string(),
         pixtool_output: result.stdout,
-        note: Some("Timing captures require administrator privileges".to_string()),
+        note: Some(
+            "The target application, not pix-mcp, selected the captured region through PIX's programmatic capture API."
+                .to_string(),
+        ),
+    })
+}
+
+fn resolve_timing_options(
+    args: &TimingCaptureArgs,
+) -> Result<(TimingCapturePreset, TimingCaptureOptions)> {
+    let preset = args.preset.unwrap_or_default();
+    let (preset_sample_rate, preset_cpu_samples, preset_callstacks, preset_gpu_timings) =
+        match preset {
+            TimingCapturePreset::Balanced => (None, true, true, true),
+            TimingCapturePreset::CpuDetailed => (Some(8_000), true, true, true),
+            TimingCapturePreset::GpuOnly => (None, false, false, true),
+            TimingCapturePreset::CpuOnly => (None, true, true, false),
+        };
+
+    let cpu_samples = args.include_cpu_samples.unwrap_or(preset_cpu_samples);
+    let sample_rate = match (args.sample_rate, cpu_samples) {
+        (Some(rate), _) => Some(rate),
+        (None, true) => preset_sample_rate,
+        // If an explicit boolean disables CPU sampling, discard the preset's
+        // rate rather than passing an option that PIX documents as ineffective.
+        (None, false) => None,
+    };
+    let options = TimingCaptureOptions::new(
+        args.duration_ms,
+        sample_rate,
+        cpu_samples,
+        args.include_callstacks.unwrap_or(preset_callstacks),
+        args.include_gpu_timings.unwrap_or(preset_gpu_timings),
+    )?;
+    Ok((preset, options))
+}
+
+pub async fn handle_pix_timing_capture(args: TimingCaptureArgs) -> Result<TimingCaptureReport> {
+    let (preset, options) = resolve_timing_options(&args)?;
+    let output_path = require_output_path(args.output_path)?;
+    let result = PixTool::timing_capture_process(args.process_id, &output_path, &options).await?;
+
+    Ok(TimingCaptureReport {
+        success: true,
+        message: result.message,
+        output_path: result.output_path.to_string_lossy().to_string(),
+        pixtool_output: result.stdout,
+        note: "Timing captures require administrator privileges. PixStorage.dll is not loaded by this server; inspect the resulting capture in PIX."
+            .to_string(),
+        settings: TimingCaptureSettingsReport {
+            preset,
+            duration_ms: options.duration_ms,
+            sample_rate: options.effective_sample_rate(),
+            cpu_samples: options.cpu_samples,
+            callstacks: options.callstacks,
+            gpu_timings: options.gpu_timings,
+        },
     })
 }
 
@@ -302,6 +446,62 @@ mod tests {
             normalize_wpix_output("capture.WPIX", "output_path").expect("accept extension"),
             PathBuf::from("capture.WPIX")
         );
+    }
+
+    #[test]
+    fn timing_presets_resolve_to_effective_documented_options() {
+        let args = TimingCaptureArgs {
+            process_id: 42,
+            output_path: Some("capture.wpix".to_string()),
+            duration_ms: Some(5_000),
+            preset: Some(TimingCapturePreset::CpuDetailed),
+            sample_rate: None,
+            include_cpu_samples: None,
+            include_callstacks: Some(false),
+            include_gpu_timings: None,
+        };
+        let (preset, options) = resolve_timing_options(&args).expect("resolve preset");
+        assert!(matches!(preset, TimingCapturePreset::CpuDetailed));
+        assert_eq!(options.duration_ms, 5_000);
+        assert_eq!(options.effective_sample_rate(), Some(8_000));
+        assert!(options.cpu_samples);
+        assert!(!options.callstacks);
+        assert!(options.gpu_timings);
+    }
+
+    #[test]
+    fn explicit_cpu_disable_drops_a_presets_implicit_sample_rate() {
+        let args = TimingCaptureArgs {
+            process_id: 42,
+            output_path: Some("capture.wpix".to_string()),
+            duration_ms: None,
+            preset: Some(TimingCapturePreset::CpuDetailed),
+            sample_rate: None,
+            include_cpu_samples: Some(false),
+            include_callstacks: None,
+            include_gpu_timings: None,
+        };
+        let (_, options) = resolve_timing_options(&args).expect("resolve override");
+        assert_eq!(options.effective_sample_rate(), None);
+        assert!(!options.cpu_samples);
+    }
+
+    #[test]
+    fn timing_options_allow_low_overhead_trace_without_samples_or_gpu_timings() {
+        let args = TimingCaptureArgs {
+            process_id: 42,
+            output_path: Some("capture.wpix".to_string()),
+            duration_ms: None,
+            preset: None,
+            sample_rate: None,
+            include_cpu_samples: Some(false),
+            include_callstacks: Some(false),
+            include_gpu_timings: Some(false),
+        };
+        let (_, options) = resolve_timing_options(&args).expect("resolve low-overhead trace");
+        assert!(!options.cpu_samples);
+        assert!(!options.callstacks);
+        assert!(!options.gpu_timings);
     }
 
     #[tokio::test]

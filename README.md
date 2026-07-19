@@ -6,7 +6,8 @@ A Model Context Protocol (MCP) server that enables AI agents (GitHub Copilot, Cl
 
 - **Launch applications with PIX** - Start executables with PIX attached for GPU capture
 - **GPU Captures** - Capture DirectX 12 GPU work to `.wpix` files
-- **Timing Captures** - Record CPU/GPU timing for performance analysis
+- **Deterministic programmatic captures** - Wait for an instrumented application to select the exact frame/region
+- **Timing Captures** - Record CPU/GPU timing with documented sampling presets and overrides
 - **Capture Analysis** - Extract event lists, counters, screenshots and validate replay with the D3D12 debug layer
 - **Structured results** - Every tool returns typed `structuredContent` with a JSON `outputSchema`
 - **Capture Management** - List and open capture files
@@ -70,7 +71,8 @@ Add to `claude_desktop_config.json`:
 | `pix_launch_and_capture` | Launch with PIX capturing from start |
 | `pix_gpu_capture` | Capture GPU frames from a running process (requires PID) |
 | `pix_gpu_capture_launch` | Launch executable and capture GPU frames to file |
-| `pix_timing_capture` | Record CPU/GPU timing from a running process (admin required) |
+| `pix_programmatic_capture` | Launch an instrumented app and wait for one app-triggered deterministic capture |
+| `pix_timing_capture` | Record timing with `balanced`, `cpu_detailed`, `gpu_only`, or `cpu_only` settings (admin required) |
 | `pix_capture_and_analyze` | **One-shot**: launch → GPU capture → frame-insights summary (+ screenshot) |
 
 ### Markers & Events
@@ -91,7 +93,7 @@ Add to `claude_desktop_config.json`:
 
 | Tool | Description |
 |------|-------------|
-| `pix_status` | Check PIX installation and server health |
+| `pix_status` | Check PIX version, advertised commands, PixStorage presence, privileges, and server health |
 | `pix_analyze_capture` | Analyze .wpix file — extract events, counters, performance data |
 | `pix_analyze_frame` | **Heuristic frame triage** — draw/dispatch/barrier counts, RT changes, top expensive events |
 | `pix_get_event_list` | Extract D3D12 events (`offset`/`limit`; `response_format` selects the 50/500 default; maximum 2000 rows and 1 MiB inline), or save the full list when `output_path` ends with `.csv` |
@@ -99,7 +101,7 @@ Add to `claude_desktop_config.json`:
 | `pix_run_analysis` | Replay with the D3D12 debug layer to validate playback; pixtool does not export the debug-layer messages |
 | `pix_get_screenshot` | Extract the frame **recorded with the capture** as PNG (`save-screenshot`) and return it inline as an image; `depth`/`marker` options save a render target/depth buffer via replay |
 | `pix_export_counters` | Parse PIX-exported counters (CSV/JSON) |
-| `pix_compare_captures` | Compare file-size and modification metadata for two captures (not a performance-regression analysis) |
+| `pix_compare_captures` | Compare bounded event structure/order/counts and optional GPU timing aggregates; falls back to metadata when replay is unavailable |
 
 ## Protocol Features
 
@@ -139,6 +141,16 @@ affect this server:
   to select a level or mode. In practice, only one non-empty, unprefixed token is safely supported.
 - **GPU capture by PID requires launch-under-PIX** (`pix_gpu_capture` only works on a process PIX
   launched). Use `pix_gpu_capture_launch` / `pix_capture_and_analyze` for a normal game.
+- **Programmatic capture is target-driven.** `pix_programmatic_capture` uses the documented
+  `launch → programmatic-capture → save-capture` chain. The target must invoke PIX's in-process
+  capture API before `timeout_seconds` (default 600, maximum 1800), otherwise the managed process
+  tree is terminated and no partial destination is left behind.
+- **Timing options map directly to pixtool.** Presets resolve to the documented `--sampleRate`,
+  `--noCpuSamples`, `--noCallstacks`, and `--noGpuTimings` options, and the response reports the
+  effective settings. Timing capture still requires an elevated server process.
+- **PixStorage is detection-only.** `pix_status` reports whether `PixStorage.dll` is installed next
+  to pixtool, but the server neither loads installation-specific native DLLs nor exposes arbitrary
+  SQLite. Timing captures should currently be queried in the PIX UI.
 - **Capture bounds are validated.** `frames` defaults to pixtool's default of 1 and accepts
   `1..=120`; timing-capture `duration_ms` defaults to 100 milliseconds and accepts `1..=600000`.
 - **`pix_run_analysis` validates replay, not the complete diagnostic stream.** The
@@ -150,8 +162,9 @@ affect this server:
   for capacity before their execution timeout starts. Background launches use a separate
   four-process pool; a fifth concurrent
   background launch fails immediately instead of waiting. Foreground operations time out after
-  10 minutes, background launches after 30 minutes, and timing captures after their requested
-  duration plus 30 seconds. Timed-out processes and cancelled foreground processes are terminated.
+  10 minutes, background launches after 30 minutes, programmatic capture uses its configurable
+  wait (maximum 30 minutes), and timing captures use their requested duration plus 30 seconds.
+  Timed-out processes and cancelled foreground processes are terminated.
 - **Analysis outputs are staged safely.** Event-list CSV and screenshot PNG outputs are written to
   isolated temporary directories, parsed/decoded to validate them, and only then replace the
   requested destination. New `.wpix` captures are likewise written to isolated same-filesystem paths,
@@ -167,6 +180,13 @@ affect this server:
 - **Responses and scans are bounded.** Inline event pages and analysis reports are capped at 1 MiB;
   counter lists expose `truncated` when their item/byte budget is reached. Capture-directory scans
   reject directories with more than 20,000 entries.
+- **Capture comparison has an honest fallback.** It ignores unstable Global IDs and compares
+  queue/name sequences and occurrence counts. CSV parsing is streamed while retaining 20,000
+  events per capture by default (configurable up to 50,000). Counter replays run serially to avoid
+  GPU measurement interference; failed counter exports are retried without counters so structural
+  comparison survives. Timing aggregates require complete exports and the same recognized duration
+  column. Results stay within 1 MiB and fall back to `metadata_only` with warnings when replay is
+  unavailable.
 
 ## Trust Model
 

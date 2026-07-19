@@ -45,8 +45,9 @@ npx @modelcontextprotocol/inspector cargo run --locked --release
   before their execution timeout starts. Background launches use a separate four-process pool; a
   fifth concurrent background launch fails immediately instead of waiting.
 - MCP request cancellation drops the active tool future. Foreground `pixtool` operations time out
-  after 10 minutes, background launches after 30 minutes, and timing captures after the requested
-  duration plus 30 seconds. Timed-out processes and cancelled foreground processes are terminated.
+  after 10 minutes, background launches after 30 minutes, programmatic capture uses its requested
+  1..=1800-second wait, and timing captures use their requested duration plus 30 seconds. Timed-out
+  processes and cancelled foreground processes are terminated.
 - MCP Tasks are not advertised; calls use normal request cancellation and the bounded timeouts
   above. `pix_open_capture` launches the WinPix GUI intentionally outside the managed pools.
 - Long calls with `_meta.progressToken` receive monotonic, rate-limited progress notifications;
@@ -60,6 +61,10 @@ npx @modelcontextprotocol/inspector cargo run --locked --release
   `PIX_MCP_ALLOW_ELEVATED_LAUNCH=true` when every allowed executable is trusted.
 - GPU capture `frames` defaults to pixtool's default of 1 and must be in `1..=120`.
   Timing-capture `duration_ms` defaults to 100 milliseconds and must be in `1..=600000`.
+- `pix_programmatic_capture` waits for one target-triggered capture for 600 seconds by default
+  (`timeout_seconds` accepts `1..=1800`). The target must use PIX's in-process capture API.
+- Timing presets expose PIX's documented CPU sample, callstack, and GPU timing switches. The
+  result reports the effective options; timing capture still requires elevation.
 - pixtool 2603.25 cannot faithfully represent application arguments containing spaces, beginning
   with `-`/`+`, or containing quotes/control characters. Such arguments are rejected before launch;
   use the application's config/`autoexec` file or an environment variable instead.
@@ -80,8 +85,15 @@ npx @modelcontextprotocol/inspector cargo run --locked --release
   summary/full and are capped at 2000 rows and 1 MiB. File-backed event CSV validation is streamed
   and capped at 128 MiB. Other inline analysis reports are capped at 1 MiB, counter lists report
   truncation explicitly, and capture-directory scans accept at most 20,000 entries.
-- `pix_compare_captures` compares file-size and modification metadata only. It does not establish a
-  performance regression; compare equivalent event timings and GPU counters for that analysis.
+- `pix_compare_captures` streams both event lists and compares queue/name order and occurrence
+  counts while ignoring unstable Global IDs. It retains 20,000 rows per capture by default
+  (maximum 50,000), reports prefix truncation, and optionally aggregates the same recognized GPU
+  duration column from complete exports. Counter replays are serialized; failure triggers a
+  counter-free retry for structural results. If replay/Developer Mode is unavailable it returns
+  `metadata_only` with warnings rather than presenting file size as a performance result.
+- `pix_status` derives the installed version from the PIX directory, detects commands from the
+  binary's own help, and reports PixStorage presence. PixStorage is never loaded and arbitrary
+  SQLite/native timing queries are not exposed.
 
 ## Local security policy
 
@@ -140,10 +152,10 @@ src/
     ├── mod.rs         # PixServer: tool routing, cancellation, elicitation, resources
     ├── status.rs      # pix_status
     ├── launch.rs      # pix_launch, pix_launch_and_capture
-    ├── capture.rs     # GPU/timing capture, list/open captures
-    ├── analysis.rs    # analyze, event list (paginated), screenshot (image), counters, frame insights
+    ├── capture.rs     # GPU/programmatic/timing capture, list/open captures
+    ├── analysis.rs    # analyze, structural compare, event list, screenshot, counters, frame insights
     ├── workflow.rs    # pix_capture_and_analyze (one-shot launch+capture+analyze)
-    └── resources.rs   # capture:// resource URIs
+    └── resources.rs   # capture:// catalog and session-local artifact:// resources
 ```
 
 ## PIX discovery
