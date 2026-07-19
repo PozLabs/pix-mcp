@@ -3,6 +3,7 @@
 mod analysis;
 mod capture;
 mod launch;
+mod prompts;
 mod resources;
 mod status;
 mod workflow;
@@ -18,7 +19,12 @@ use std::{
 use anyhow::Result as AnyResult;
 use rmcp::{
     ErrorData as McpError, Json, Peer, RoleServer, ServerHandler, elicit_safe,
-    handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
+    handler::server::{
+        prompt::PromptContext,
+        router::{prompt::PromptRouter, tool::ToolRouter},
+        tool::ToolCallContext,
+        wrapper::Parameters,
+    },
     model::*,
     schemars,
     service::{ElicitationMode, PeerRequestOptions, RequestContext, RequestHandle},
@@ -39,12 +45,18 @@ const PROGRESS_NOTIFICATION_INTERVAL: Duration = Duration::from_secs(1);
 const PROGRESS_NOTIFICATION_TIMEOUT: Duration = Duration::from_millis(250);
 const RESOURCE_PAGE_SIZE: usize = 100;
 const RESOURCE_CURSOR_PREFIX: &str = "pix-captures-v2:";
+const MAX_CONCURRENT_CATALOG_OPERATIONS: usize = 2;
+const MAX_COMPLETION_REFERENCE_BYTES: usize = 2_048;
+const MAX_COMPLETION_NAME_BYTES: usize = 128;
+const MAX_COMPLETION_CONTEXT_VALUE_BYTES: usize = 32 * 1024;
 
 /// The PIX MCP server. Tools are registered through the `#[tool_router]` macro.
 #[derive(Clone)]
 pub struct PixServer {
     tool_router: ToolRouter<Self>,
     artifact_registry: resources::ArtifactRegistry,
+    prompt_router: PromptRouter<Self>,
+    catalog_concurrency: Arc<Semaphore>,
 }
 
 /// Service wrapper that normalizes task-augmented tool calls to direct calls.
@@ -234,6 +246,33 @@ fn reject_cursor(request: Option<&PaginatedRequestParams>, endpoint: &str) -> Re
     }
 }
 
+fn validate_completion_field(
+    value: &str,
+    field: &'static str,
+    max_bytes: usize,
+) -> Result<(), McpError> {
+    if value.len() > max_bytes {
+        return Err(McpError::invalid_params(
+            format!("{field} exceeds the {max_bytes} byte limit"),
+            Some(serde_json::json!({ "field": field, "maxBytes": max_bytes })),
+        ));
+    }
+    Ok(())
+}
+
+fn prompt_argument_max_bytes(prompt: &str, argument: &str) -> Option<usize> {
+    match (prompt, argument) {
+        ("debug_rendering_issue", "exe_path" | "output_path") => Some(32 * 1024),
+        ("debug_rendering_issue", "symptom")
+        | ("profile_frame", "focus")
+        | ("compare_captures", "focus") => Some(8 * 1024),
+        ("profile_frame", "capture_id") | ("compare_captures", "baseline_id" | "candidate_id") => {
+            Some(resources::MAX_CAPTURE_ID_BYTES)
+        }
+        _ => None,
+    }
+}
+
 fn map_resource_error(error: resources::ResourceReadError, uri: &str) -> McpError {
     match error {
         resources::ResourceReadError::InvalidRequest(message) => {
@@ -247,6 +286,22 @@ fn map_resource_error(error: resources::ResourceReadError, uri: &str) -> McpErro
             McpError::internal_error(
                 "Failed to read PIX resource",
                 Some(serde_json::json!({ "uri": uri })),
+            )
+        }
+    }
+}
+
+fn map_prompt_capture_error(error: resources::ResourceReadError, prompt: &'static str) -> McpError {
+    match error {
+        resources::ResourceReadError::InvalidRequest(message)
+        | resources::ResourceReadError::NotFound(message) => {
+            McpError::invalid_params(message, Some(serde_json::json!({ "prompt": prompt })))
+        }
+        resources::ResourceReadError::Internal(error) => {
+            tracing::error!(%error, %prompt, "Failed to validate PIX prompt capture");
+            McpError::internal_error(
+                "Could not validate the PIX capture for this prompt",
+                Some(serde_json::json!({ "prompt": prompt })),
             )
         }
     }
@@ -527,6 +582,22 @@ impl PixServer {
         Self {
             tool_router: Self::tool_router(),
             artifact_registry: resources::ArtifactRegistry::default(),
+            prompt_router: Self::prompt_router(),
+            catalog_concurrency: Arc::new(Semaphore::new(MAX_CONCURRENT_CATALOG_OPERATIONS)),
+        }
+    }
+
+    fn acquire_catalog_permit(&self) -> Result<OwnedSemaphorePermit, McpError> {
+        match self.catalog_concurrency.clone().try_acquire_owned() {
+            Ok(permit) => Ok(permit),
+            Err(tokio::sync::TryAcquireError::NoPermits) => Err(McpError::internal_error(
+                "Capture catalog is busy; retry shortly",
+                None,
+            )),
+            Err(tokio::sync::TryAcquireError::Closed) => Err(McpError::internal_error(
+                "Capture catalog is unavailable",
+                None,
+            )),
         }
     }
 
@@ -1096,11 +1167,83 @@ impl PixServer {
     }
 }
 
+#[rmcp::prompt_router(router = "prompt_router")]
+impl PixServer {
+    #[rmcp::prompt(
+        name = "debug_rendering_issue",
+        description = "Guided PIX workflow to reproduce, capture, and triage a DirectX 12 rendering defect."
+    )]
+    async fn debug_rendering_issue_prompt(
+        &self,
+        Parameters(args): Parameters<prompts::DebugRenderingIssueArgs>,
+    ) -> Result<GetPromptResult, McpError> {
+        let text = prompts::debug_rendering_issue_text(args)
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        Ok(
+            GetPromptResult::new(vec![PromptMessage::new_text(Role::User, text)])
+                .with_description("Capture and triage a rendering issue with bounded PIX evidence"),
+        )
+    }
+
+    #[rmcp::prompt(
+        name = "profile_frame",
+        description = "Guided, evidence-based performance analysis of an existing PIX GPU capture."
+    )]
+    async fn profile_frame_prompt(
+        &self,
+        Parameters(mut args): Parameters<prompts::ProfileFrameArgs>,
+    ) -> Result<GetPromptResult, McpError> {
+        prompts::validate_profile_frame_args(&args)
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let permit = self.acquire_catalog_permit()?;
+        args.capture_id = prompts::validate_profile_capture(&args.capture_id, permit)
+            .await
+            .map_err(|error| map_prompt_capture_error(error, "profile_frame"))?;
+        let text = prompts::profile_frame_text(args)
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        Ok(
+            GetPromptResult::new(vec![PromptMessage::new_text(Role::User, text)]).with_description(
+                "Profile a PIX frame and report measured hotspots and limitations",
+            ),
+        )
+    }
+
+    #[rmcp::prompt(
+        name = "compare_captures",
+        description = "Guided structural and performance comparison of baseline and candidate PIX captures."
+    )]
+    async fn compare_captures_prompt(
+        &self,
+        Parameters(mut args): Parameters<prompts::CompareCapturesPromptArgs>,
+    ) -> Result<GetPromptResult, McpError> {
+        prompts::validate_compare_captures_args(&args)
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let permit = self.acquire_catalog_permit()?;
+        let (baseline_id, candidate_id) =
+            prompts::validate_distinct_captures(&args.baseline_id, &args.candidate_id, permit)
+                .await
+                .map_err(|error| map_prompt_capture_error(error, "compare_captures"))?;
+        args.baseline_id = baseline_id;
+        args.candidate_id = candidate_id;
+        let text = prompts::compare_captures_text(args)
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+            Role::User,
+            text,
+        )])
+        .with_description(
+            "Compare two PIX captures while keeping structural evidence and statistical claims distinct",
+        ))
+    }
+}
+
 impl ServerHandler for PixServer {
     fn get_info(&self) -> ServerInfo {
         let capabilities = ServerCapabilities::builder()
             .enable_tools()
             .enable_resources()
+            .enable_prompts()
+            .enable_completions()
             .build();
 
         ServerInfo::new(capabilities)
@@ -1117,7 +1260,9 @@ impl ServerHandler for PixServer {
                  pix_analyze_frame (heuristic triage), pix_get_event_list (paginated), \
                  pix_get_screenshot (returns the frame as an image), pix_list_counters, and \
                  pix_run_analysis (playback validation only; pixtool does not export debug-layer \
-                 messages). Tool cancellation terminates managed pixtool subprocesses. \
+                 messages). Reusable prompts guide rendering triage, frame profiling, and capture \
+                 comparison; completion suggests capture IDs from the resource catalog. Tool \
+                 cancellation terminates managed pixtool subprocesses. \
                  pix_open_capture opens the PIX GUI."
                     .to_string(),
             )
@@ -1160,24 +1305,266 @@ impl ServerHandler for PixServer {
         self.tool_router.get(name).cloned()
     }
 
+    async fn list_prompts(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, McpError> {
+        reject_cursor(request.as_ref(), "prompts/list")?;
+        Ok(ListPromptsResult::with_all_items(
+            self.prompt_router.list_all(),
+        ))
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResult, McpError> {
+        let cancellation = context.ct.clone();
+        let prompt = self.prompt_router.get_prompt(PromptContext::new(
+            self,
+            request.name,
+            request.arguments,
+            context,
+        ));
+        tokio::select! {
+            result = prompt => result,
+            _ = cancellation.cancelled() => {
+                Err(McpError::internal_error("Prompt request cancelled", None))
+            }
+        }
+    }
+
+    async fn complete(
+        &self,
+        request: CompleteRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CompleteResult, McpError> {
+        validate_completion_field(
+            &request.argument.name,
+            "completion argument name",
+            MAX_COMPLETION_NAME_BYTES,
+        )?;
+        validate_completion_field(
+            &request.argument.value,
+            "completion argument value",
+            MAX_COMPLETION_CONTEXT_VALUE_BYTES,
+        )?;
+        match &request.r#ref {
+            Reference::Prompt(reference) => {
+                validate_completion_field(
+                    &reference.name,
+                    "completion prompt reference",
+                    MAX_COMPLETION_NAME_BYTES,
+                )?;
+                if let Some(title) = reference.title.as_deref() {
+                    validate_completion_field(
+                        title,
+                        "completion prompt title",
+                        MAX_COMPLETION_REFERENCE_BYTES,
+                    )?;
+                }
+            }
+            Reference::Resource(reference) => validate_completion_field(
+                &reference.uri,
+                "completion resource reference",
+                MAX_COMPLETION_REFERENCE_BYTES,
+            )?,
+            _ => {
+                return Err(McpError::invalid_params(
+                    "Unsupported completion reference",
+                    None,
+                ));
+            }
+        }
+        if let Some(completion_context) = request.context.as_ref()
+            && let Some(arguments) = completion_context.arguments.as_ref()
+        {
+            for (name, value) in arguments {
+                validate_completion_field(
+                    name,
+                    "completion context argument name",
+                    MAX_COMPLETION_NAME_BYTES,
+                )?;
+                validate_completion_field(
+                    value,
+                    "completion context argument value",
+                    MAX_COMPLETION_CONTEXT_VALUE_BYTES,
+                )?;
+            }
+        }
+
+        let argument = request.argument.name.as_str();
+        let mut excluded_capture_id = None;
+        let completes_capture = if let Some(name) = request.r#ref.as_prompt_name() {
+            let valid_arguments: &[&str] = match name {
+                "debug_rendering_issue" => &["exe_path", "output_path", "symptom"],
+                "profile_frame" => &["capture_id", "focus"],
+                "compare_captures" => &["baseline_id", "candidate_id", "focus"],
+                _ => {
+                    return Err(McpError::invalid_params(
+                        "Unknown prompt reference for completion",
+                        Some(serde_json::json!({ "prompt": name })),
+                    ));
+                }
+            };
+            if !valid_arguments.contains(&argument) {
+                return Err(McpError::invalid_params(
+                    "Completion argument is not declared by the referenced prompt",
+                    Some(serde_json::json!({ "prompt": name, "argument": argument })),
+                ));
+            }
+            let value_limit = prompt_argument_max_bytes(name, argument)
+                .expect("declared prompt arguments have a configured input limit");
+            validate_completion_field(
+                &request.argument.value,
+                "completion argument value",
+                value_limit,
+            )?;
+            if let Some(completion_context) = request.context.as_ref()
+                && let Some(unknown) = completion_context
+                    .argument_names()
+                    .find(|name| !valid_arguments.contains(name))
+            {
+                return Err(McpError::invalid_params(
+                    "Completion context contains an argument not declared by the prompt",
+                    Some(serde_json::json!({ "prompt": name, "argument": unknown })),
+                ));
+            }
+            if let Some(arguments) = request
+                .context
+                .as_ref()
+                .and_then(|context| context.arguments.as_ref())
+            {
+                for (context_name, value) in arguments {
+                    let value_limit = prompt_argument_max_bytes(name, context_name)
+                        .expect("validated prompt context arguments have an input limit");
+                    validate_completion_field(
+                        value,
+                        "completion context argument value",
+                        value_limit,
+                    )?;
+                }
+            }
+
+            excluded_capture_id = match (name, argument) {
+                ("compare_captures", "candidate_id") => request
+                    .context
+                    .as_ref()
+                    .and_then(|context| context.get_argument("baseline_id"))
+                    .cloned(),
+                ("compare_captures", "baseline_id") => request
+                    .context
+                    .as_ref()
+                    .and_then(|context| context.get_argument("candidate_id"))
+                    .cloned(),
+                _ => None,
+            };
+            matches!(
+                (name, argument),
+                ("profile_frame", "capture_id")
+                    | ("compare_captures", "baseline_id" | "candidate_id")
+            )
+        } else if let Some(uri) = request.r#ref.as_resource_uri() {
+            if !matches!(
+                uri,
+                "capture://{id}"
+                    | "capture://{id}/metadata"
+                    | "capture://{id}/events"
+                    | "capture://{id}/counters"
+            ) {
+                return Err(McpError::invalid_params(
+                    "Unknown resource template reference for completion",
+                    Some(serde_json::json!({ "uri": uri })),
+                ));
+            }
+            if argument != "id" {
+                return Err(McpError::invalid_params(
+                    "Completion argument is not declared by the resource template",
+                    Some(serde_json::json!({ "uri": uri, "argument": argument })),
+                ));
+            }
+            validate_completion_field(
+                &request.argument.value,
+                "completion argument value",
+                resources::MAX_CAPTURE_ID_BYTES,
+            )?;
+            if let Some(completion_context) = request.context.as_ref()
+                && let Some(unknown) = completion_context
+                    .argument_names()
+                    .find(|name| *name != "id")
+            {
+                return Err(McpError::invalid_params(
+                    "Completion context contains an argument not declared by the resource template",
+                    Some(serde_json::json!({ "uri": uri, "argument": unknown })),
+                ));
+            }
+            if let Some(arguments) = request
+                .context
+                .as_ref()
+                .and_then(|context| context.arguments.as_ref())
+            {
+                for value in arguments.values() {
+                    validate_completion_field(
+                        value,
+                        "completion context argument value",
+                        resources::MAX_CAPTURE_ID_BYTES,
+                    )?;
+                }
+            }
+            true
+        } else {
+            return Err(McpError::invalid_params(
+                "Unsupported completion reference",
+                None,
+            ));
+        };
+
+        let completion = if completes_capture {
+            prompts::validate_completion_query(&request.argument.value)
+                .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+            if let Some(id) = excluded_capture_id.as_deref() {
+                prompts::validate_capture_id_argument(id)
+                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+            }
+            let permit = self.acquire_catalog_permit()?;
+            let completion = prompts::complete_capture_ids(
+                &request.argument.value,
+                excluded_capture_id.as_deref(),
+                permit,
+            );
+            tokio::select! {
+                result = completion => result.map_err(|error| {
+                    tracing::error!(%error, "Could not complete PIX capture IDs");
+                    McpError::internal_error("Could not complete PIX capture IDs", None)
+                })?,
+                _ = context.ct.cancelled() => {
+                    return Err(McpError::internal_error("Completion request cancelled", None));
+                }
+            }
+        } else {
+            CompletionInfo::with_all_values(Vec::new())
+                .expect("an empty completion response is always valid")
+        };
+
+        Ok(CompleteResult::new(completion))
+    }
+
     async fn list_resources(
         &self,
         request: Option<PaginatedRequestParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
         let captures_dir = crate::security::capture_directory().map_err(|error| {
-            McpError::internal_error(
-                "Could not resolve the PIX capture resource directory",
-                Some(serde_json::json!({ "reason": error.to_string() })),
-            )
+            tracing::error!(%error, "Could not resolve the PIX capture resource directory");
+            McpError::internal_error("Could not resolve the PIX capture resource directory", None)
         })?;
         let resources = resources::list_capture_resources(Some(&captures_dir))
             .await
             .map_err(|error| {
-                McpError::internal_error(
-                    "Could not build the PIX capture resource catalog",
-                    Some(serde_json::json!({ "reason": error.to_string() })),
-                )
+                tracing::error!(%error, "Could not build the PIX capture resource catalog");
+                McpError::internal_error("Could not build the PIX capture resource catalog", None)
             })?;
         let total = resources.len();
         let generation = resource_catalog_generation(&resources);
@@ -1553,5 +1940,60 @@ mod tests {
         assert_eq!(link.size, None);
         assert_eq!(link.mime_type.as_deref(), Some("application/json"));
         assert!(link.uri.starts_with("artifact://local/"));
+    }
+
+    #[test]
+    fn prompt_catalog_is_sorted_and_declares_capture_arguments() {
+        let server = PixServer::new();
+        let prompts = server.prompt_router.list_all();
+        let names = prompts
+            .iter()
+            .map(|prompt| prompt.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["compare_captures", "debug_rendering_issue", "profile_frame"]
+        );
+
+        let profile = prompts
+            .iter()
+            .find(|prompt| prompt.name == "profile_frame")
+            .expect("profile_frame prompt");
+        let capture_id = profile
+            .arguments
+            .as_ref()
+            .expect("prompt arguments")
+            .iter()
+            .find(|argument| argument.name == "capture_id")
+            .expect("capture_id argument");
+        assert_eq!(capture_id.required, Some(true));
+    }
+
+    #[test]
+    fn server_advertises_static_prompts_and_completion() {
+        let info = PixServer::new().get_info();
+        assert!(info.capabilities.prompts.is_some());
+        assert!(info.capabilities.completions.is_some());
+        assert_eq!(
+            info.capabilities
+                .prompts
+                .as_ref()
+                .and_then(|capability| capability.list_changed),
+            None
+        );
+    }
+
+    #[test]
+    fn capture_catalog_concurrency_is_shared_and_bounded() {
+        let server = PixServer::new();
+        let first = server.acquire_catalog_permit().expect("first permit");
+        let second = server.acquire_catalog_permit().expect("second permit");
+        assert!(
+            server.acquire_catalog_permit().is_err(),
+            "a third catalog operation must be rejected while both slots are occupied"
+        );
+        drop(first);
+        assert!(server.acquire_catalog_permit().is_ok());
+        drop(second);
     }
 }

@@ -12,10 +12,14 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use rmcp::model::{Annotations, Resource, Role};
 use serde_json::json;
+use tokio::sync::OwnedSemaphorePermit;
 
 const MAX_CAPTURE_DIRECTORY_ENTRIES: usize = 20_000;
 const MAX_ARTIFACT_REGISTRY_ENTRIES: usize = 4_096;
 const MAX_INLINE_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_CAPTURE_ID_BYTES: usize = 1_024;
+const MAX_AMBIGUOUS_MATCHES_REPORTED: usize = 10;
+const MAX_AMBIGUOUS_NAME_BYTES: usize = 256;
 
 /// Failures from `resources/read`, classified so the protocol layer can use
 /// the correct JSON-RPC error instead of reporting every failure as missing.
@@ -403,6 +407,39 @@ pub async fn read_capture_resource_text(
     })?
 }
 
+/// Resolve capture IDs through the same bounded, traversal-safe catalog used
+/// by `resources/read`. The catalog permit is held inside the blocking task so
+/// cancellation cannot release capacity while the filesystem scan still runs.
+pub async fn resolve_capture_paths(
+    ids: &[&str],
+    captures_dir: Option<&Path>,
+    permit: OwnedSemaphorePermit,
+) -> std::result::Result<Vec<PathBuf>, ResourceReadError> {
+    for id in ids {
+        validate_capture_id(id)
+            .map_err(|error| ResourceReadError::InvalidRequest(error.to_string()))?;
+    }
+    let dir = match captures_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => crate::security::capture_directory().map_err(ResourceReadError::Internal)?,
+    };
+    let ids = ids.iter().map(|id| (*id).to_string()).collect::<Vec<_>>();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        // Revalidate and canonicalize immediately before the scan so a capture
+        // directory replaced after server startup cannot bypass input roots.
+        let dir = crate::security::validate_input_directory(&dir, "Capture directory")
+            .map_err(ResourceReadError::Internal)?;
+        ids.iter()
+            .map(|id| find_capture_by_id(&dir, id).map_err(map_lookup_error))
+            .collect()
+    })
+    .await
+    .map_err(|error| {
+        ResourceReadError::Internal(anyhow::anyhow!("Capture resolution task failed: {error}"))
+    })?
+}
+
 fn read_capture_resource_text_sync(
     resource: CaptureResource,
     captures_dir: Option<&Path>,
@@ -490,6 +527,12 @@ fn has_wpix_extension(path: &Path) -> bool {
 }
 
 fn validate_capture_id(id: &str) -> Result<()> {
+    if id.len() > MAX_CAPTURE_ID_BYTES {
+        return Err(anyhow::anyhow!(
+            "Capture ID must not exceed {} UTF-8 bytes",
+            MAX_CAPTURE_ID_BYTES
+        ));
+    }
     if id.trim().is_empty() {
         return Err(anyhow::anyhow!("Capture ID must not be empty"));
     }
@@ -538,15 +581,33 @@ fn require_unique_match(
         paths => {
             let names = paths
                 .iter()
+                .take(MAX_AMBIGUOUS_MATCHES_REPORTED)
                 .filter_map(|path| path.file_name())
-                .map(|name| name.to_string_lossy())
+                .map(|name| truncate_utf8(&name.to_string_lossy(), MAX_AMBIGUOUS_NAME_BYTES))
                 .collect::<Vec<_>>()
                 .join(", ");
+            let omitted = paths.len().saturating_sub(MAX_AMBIGUOUS_MATCHES_REPORTED);
+            let suffix = if omitted == 0 {
+                String::new()
+            } else {
+                format!(", and {omitted} more")
+            };
             Err(CaptureLookupError::Ambiguous(format!(
-                "Capture ID is ambiguous: {id}. Matches: {names}"
+                "Capture ID is ambiguous: {id}. Matches: {names}{suffix}"
             )))
         }
     }
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &value[..end])
 }
 
 /// Find a capture file by filename/stem or an unambiguous partial stem match.
@@ -660,6 +721,33 @@ mod tests {
         assert!(find_capture_by_id(&dir, "../outside").is_err());
         assert!(find_capture_by_id(&dir, &dir.join("outside.wpix").to_string_lossy()).is_err());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn capture_id_and_ambiguous_errors_are_bounded() {
+        let oversized = "x".repeat(MAX_CAPTURE_ID_BYTES + 1);
+        let error = validate_capture_id(&oversized).expect_err("oversized ID must be rejected");
+        assert!(error.to_string().contains("must not exceed"));
+
+        let matches = (0..12)
+            .map(|index| PathBuf::from(format!("scene-{index:02}.wpix")))
+            .collect::<Vec<_>>();
+        let error = require_unique_match("scene", &matches)
+            .expect_err("multiple captures must remain ambiguous")
+            .to_string();
+        assert!(error.contains("scene-00.wpix"));
+        assert!(error.contains("and 2 more"));
+        assert!(!error.contains("scene-11.wpix"));
+        assert!(error.len() < 4_096, "ambiguous error must stay bounded");
+    }
+
+    #[test]
+    fn ambiguous_name_truncation_preserves_utf8_boundaries() {
+        let value = "€".repeat(100);
+        let truncated = truncate_utf8(&value, 256);
+        assert!(truncated.ends_with('…'));
+        assert!(truncated.len() <= 259);
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
     }
 
     #[test]
