@@ -1,12 +1,76 @@
 //! MCP resource logic for PIX captures (`capture://...` URIs).
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::{HashMap, VecDeque},
+    fmt,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{Context, Result};
-use percent_encoding::percent_decode_str;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
+use rmcp::model::{Annotations, Resource, Role};
 use serde_json::json;
 
 const MAX_CAPTURE_DIRECTORY_ENTRIES: usize = 20_000;
+const MAX_ARTIFACT_REGISTRY_ENTRIES: usize = 4_096;
+const MAX_INLINE_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Failures from `resources/read`, classified so the protocol layer can use
+/// the correct JSON-RPC error instead of reporting every failure as missing.
+#[derive(Debug)]
+pub enum ResourceReadError {
+    InvalidRequest(String),
+    NotFound(String),
+    Internal(anyhow::Error),
+}
+
+impl fmt::Display for ResourceReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRequest(message) | Self::NotFound(message) => formatter.write_str(message),
+            Self::Internal(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ResourceReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Internal(error) => Some(error.as_ref()),
+            Self::InvalidRequest(_) | Self::NotFound(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum CaptureLookupError {
+    InvalidId(String),
+    NotFound(String),
+    Ambiguous(String),
+    Internal(anyhow::Error),
+}
+
+impl fmt::Display for CaptureLookupError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidId(message) | Self::NotFound(message) | Self::Ambiguous(message) => {
+                formatter.write_str(message)
+            }
+            Self::Internal(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for CaptureLookupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Internal(error) => Some(error.as_ref()),
+            Self::InvalidId(_) | Self::NotFound(_) | Self::Ambiguous(_) => None,
+        }
+    }
+}
 
 /// A parsed `capture://` resource URI.
 #[derive(Debug, Clone)]
@@ -16,6 +80,250 @@ pub enum CaptureResource {
     Events(String),
     Counters(String),
     Metadata(String),
+}
+
+fn assistant_annotations(priority: f32) -> Annotations {
+    Annotations::default()
+        .with_audience(vec![Role::Assistant])
+        .with_priority(priority)
+}
+
+fn capture_uri(name: &str) -> String {
+    format!("capture://{}", utf8_percent_encode(name, NON_ALPHANUMERIC))
+}
+
+#[derive(Debug, Clone)]
+struct ArtifactEntry {
+    path: PathBuf,
+    title: String,
+    name: String,
+    original_mime_type: String,
+    descriptor_only: bool,
+}
+
+#[derive(Debug, Default)]
+struct ArtifactRegistryState {
+    next_id: u64,
+    order: VecDeque<u64>,
+    entries: HashMap<u64, ArtifactEntry>,
+}
+
+/// Session-local registry backing dereferenceable `artifact://` resource
+/// links. Only artifacts returned by successful tools are registered; clients
+/// cannot turn an arbitrary local path into a resource URI.
+#[derive(Debug, Clone, Default)]
+pub struct ArtifactRegistry {
+    inner: Arc<Mutex<ArtifactRegistryState>>,
+}
+
+impl ArtifactRegistry {
+    fn register(&self, entry: ArtifactEntry) -> Option<u64> {
+        let mut state = self.inner.lock().ok()?;
+        state.next_id = state.next_id.wrapping_add(1).max(1);
+        let id = state.next_id;
+        if state.entries.len() >= MAX_ARTIFACT_REGISTRY_ENTRIES
+            && let Some(oldest) = state.order.pop_front()
+        {
+            state.entries.remove(&oldest);
+        }
+        state.order.push_back(id);
+        state.entries.insert(id, entry);
+        Some(id)
+    }
+
+    fn get(&self, id: u64) -> std::result::Result<ArtifactEntry, ResourceReadError> {
+        let state = self.inner.lock().map_err(|_| {
+            ResourceReadError::Internal(anyhow::anyhow!("Artifact registry lock is poisoned"))
+        })?;
+        state.entries.get(&id).cloned().ok_or_else(|| {
+            ResourceReadError::NotFound(format!("Artifact resource not found or expired: {id}"))
+        })
+    }
+}
+
+/// Contents returned by a registered artifact resource.
+pub enum ArtifactPayload {
+    Text { text: String, mime_type: String },
+    Blob { base64: String, mime_type: String },
+}
+
+/// Register a successful local output as an MCP resource link. Small text and
+/// image artifacts are readable directly; large/binary captures resolve to a
+/// bounded JSON descriptor instead of injecting an unbounded blob into MCP.
+pub fn local_artifact_resource(
+    registry: &ArtifactRegistry,
+    path: impl AsRef<Path>,
+    title: &str,
+    mime_type: &str,
+) -> Option<Resource> {
+    let path = path.as_ref();
+    let resolved = crate::security::resolve_artifact_path(path, "Artifact path").ok()?;
+    let canonical = std::fs::canonicalize(resolved).ok()?;
+    let metadata = std::fs::metadata(&canonical).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+
+    let name = canonical
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| title.to_string());
+    let descriptor_only = metadata.len() > MAX_INLINE_ARTIFACT_BYTES
+        || mime_type.eq_ignore_ascii_case("application/octet-stream");
+    let id = registry.register(ArtifactEntry {
+        path: canonical,
+        title: title.to_string(),
+        name: name.clone(),
+        original_mime_type: mime_type.to_string(),
+        descriptor_only,
+    })?;
+    let uri = format!("artifact://local/{id}");
+    let exposed_mime_type = if descriptor_only {
+        "application/json"
+    } else {
+        mime_type
+    };
+    let mut resource = Resource::new(uri, name)
+        .with_title(title)
+        .with_description(if descriptor_only {
+            format!("Bounded descriptor for a local {mime_type} PIX artifact")
+        } else {
+            "Session-local PIX artifact produced by this server".to_string()
+        })
+        .with_mime_type(exposed_mime_type)
+        .with_annotations(assistant_annotations(0.9));
+
+    if !descriptor_only {
+        resource = resource.with_size(metadata.len());
+    }
+    if let Ok(modified) = metadata.modified() {
+        let annotations = assistant_annotations(0.9).with_timestamp(modified.into());
+        resource = resource.with_annotations(annotations);
+    }
+    Some(resource)
+}
+
+pub async fn read_artifact_resource(
+    registry: &ArtifactRegistry,
+    uri: &str,
+) -> std::result::Result<ArtifactPayload, ResourceReadError> {
+    let id = uri
+        .strip_prefix("artifact://local/")
+        .filter(|value| !value.is_empty() && !value.contains('/'))
+        .ok_or_else(|| ResourceReadError::InvalidRequest("Invalid artifact URI".to_string()))?
+        .parse::<u64>()
+        .map_err(|_| ResourceReadError::InvalidRequest("Invalid artifact ID".to_string()))?;
+    let entry = registry.get(id)?;
+
+    tokio::task::spawn_blocking(move || read_artifact_entry(entry))
+        .await
+        .map_err(|error| {
+            ResourceReadError::Internal(anyhow::anyhow!("Artifact read task failed: {error}"))
+        })?
+}
+
+fn read_artifact_entry(
+    entry: ArtifactEntry,
+) -> std::result::Result<ArtifactPayload, ResourceReadError> {
+    let canonical = std::fs::canonicalize(&entry.path).map_err(|error| {
+        ResourceReadError::Internal(anyhow::Error::new(error).context("Artifact is unavailable"))
+    })?;
+    if canonical != entry.path {
+        return Err(ResourceReadError::InvalidRequest(
+            "Artifact path changed after it was registered".to_string(),
+        ));
+    }
+    let metadata = std::fs::metadata(&canonical).map_err(|error| {
+        ResourceReadError::Internal(anyhow::Error::new(error).context("Cannot inspect artifact"))
+    })?;
+    if !metadata.is_file() {
+        return Err(ResourceReadError::NotFound(
+            "Registered artifact is no longer a file".to_string(),
+        ));
+    }
+
+    if entry.descriptor_only {
+        let descriptor = json!({
+            "name": entry.name,
+            "title": entry.title,
+            "path": canonical.to_string_lossy(),
+            "mime_type": entry.original_mime_type,
+            "size_bytes": metadata.len(),
+            "last_modified": metadata.modified().ok().and_then(|time| {
+                time.duration_since(std::time::UNIX_EPOCH).ok().map(|duration| duration.as_secs())
+            }),
+            "note": "The artifact is intentionally represented by a bounded descriptor; use the local path with an appropriate PIX tool."
+        });
+        return serde_json::to_string_pretty(&descriptor)
+            .map(|text| ArtifactPayload::Text {
+                text,
+                mime_type: "application/json".to_string(),
+            })
+            .map_err(|error| ResourceReadError::Internal(error.into()));
+    }
+    if metadata.len() > MAX_INLINE_ARTIFACT_BYTES {
+        return Err(ResourceReadError::InvalidRequest(format!(
+            "Artifact grew beyond the {} byte MCP resource limit",
+            MAX_INLINE_ARTIFACT_BYTES
+        )));
+    }
+
+    let bytes = std::fs::read(&canonical).map_err(|error| {
+        ResourceReadError::Internal(anyhow::Error::new(error).context("Could not read artifact"))
+    })?;
+    if entry.original_mime_type.starts_with("text/")
+        || entry.original_mime_type == "application/json"
+    {
+        let text = String::from_utf8(bytes).map_err(|_| {
+            ResourceReadError::InvalidRequest(
+                "Registered text artifact is not valid UTF-8".to_string(),
+            )
+        })?;
+        Ok(ArtifactPayload::Text {
+            text,
+            mime_type: entry.original_mime_type,
+        })
+    } else {
+        Ok(ArtifactPayload::Blob {
+            base64: BASE64_STANDARD.encode(bytes),
+            mime_type: entry.original_mime_type,
+        })
+    }
+}
+
+/// Build the concrete capture resource catalog. Capture order is
+/// deterministic (newest first, then filename) because `PixTool` applies a
+/// stable tie-breaker.
+pub async fn list_capture_resources(captures_dir: Option<&Path>) -> Result<Vec<Resource>> {
+    let dir = match captures_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => crate::security::capture_directory()?,
+    };
+    let captures = tokio::task::spawn_blocking(move || crate::pix::PixTool::list_captures(&dir))
+        .await
+        .context("Capture resource catalog task failed")??;
+
+    let mut resources = Vec::with_capacity(captures.len().saturating_add(1));
+    resources.push(
+        Resource::new("capture://list", "pix-capture-list")
+            .with_title("PIX capture list")
+            .with_description("JSON index of PIX captures in the configured capture directory")
+            .with_mime_type("application/json")
+            .with_annotations(assistant_annotations(1.0)),
+    );
+    resources.extend(captures.into_iter().map(|capture| {
+        let mut annotations = assistant_annotations(0.8);
+        if let Some(modified) = capture.modified {
+            annotations = annotations.with_timestamp(modified.into());
+        }
+        Resource::new(capture_uri(&capture.name), capture.name.clone())
+            .with_title(capture.name.clone())
+            .with_description("Microsoft PIX capture metadata and analysis entry point")
+            .with_mime_type("application/json")
+            .with_size(capture.size_bytes)
+            .with_annotations(annotations)
+    }));
+    Ok(resources)
 }
 
 /// Parse a `capture://` resource URI.
@@ -79,29 +387,37 @@ fn decode_uri_segment(segment: &str) -> Result<String> {
 }
 
 /// Read a `capture://` resource and return its JSON text payload.
-pub async fn read_capture_resource_text(uri: &str, captures_dir: Option<&Path>) -> Result<String> {
-    let uri = uri.to_string();
+pub async fn read_capture_resource_text(
+    uri: &str,
+    captures_dir: Option<&Path>,
+) -> std::result::Result<String, ResourceReadError> {
+    let resource = parse_capture_uri(uri)
+        .map_err(|error| ResourceReadError::InvalidRequest(error.to_string()))?;
     let captures_dir = captures_dir.map(Path::to_path_buf);
     tokio::task::spawn_blocking(move || {
-        read_capture_resource_text_sync(&uri, captures_dir.as_deref())
+        read_capture_resource_text_sync(resource, captures_dir.as_deref())
     })
     .await
-    .context("Capture resource task failed")?
+    .map_err(|error| {
+        ResourceReadError::Internal(anyhow::anyhow!("Capture resource task failed: {error}"))
+    })?
 }
 
-fn read_capture_resource_text_sync(uri: &str, captures_dir: Option<&Path>) -> Result<String> {
-    let resource =
-        parse_capture_uri(uri).with_context(|| format!("Invalid capture URI: {}", uri))?;
-
+fn read_capture_resource_text_sync(
+    resource: CaptureResource,
+    captures_dir: Option<&Path>,
+) -> std::result::Result<String, ResourceReadError> {
     let dir = match captures_dir {
         Some(dir) => dir.to_path_buf(),
-        None => crate::security::capture_directory()?,
+        None => crate::security::capture_directory().map_err(ResourceReadError::Internal)?,
     };
-    let dir = crate::security::validate_input_directory(&dir, "Capture directory")?;
+    let dir = crate::security::validate_input_directory(&dir, "Capture directory")
+        .map_err(ResourceReadError::Internal)?;
 
     let payload = match resource {
         CaptureResource::List => {
-            let captures = crate::pix::PixTool::list_captures(&dir)?;
+            let captures =
+                crate::pix::PixTool::list_captures(&dir).map_err(ResourceReadError::Internal)?;
             const RESOURCE_CAPTURE_LIMIT: usize = 500;
             let total_count = captures.len();
             let list: Vec<_> = captures
@@ -119,8 +435,9 @@ fn read_capture_resource_text_sync(uri: &str, captures_dir: Option<&Path>) -> Re
             })
         }
         CaptureResource::Capture(id) | CaptureResource::Metadata(id) => {
-            let capture_path = find_capture_by_id(&dir, &id)?;
-            let metadata = std::fs::metadata(&capture_path)?;
+            let capture_path = find_capture_by_id(&dir, &id).map_err(map_lookup_error)?;
+            let metadata = std::fs::metadata(&capture_path)
+                .map_err(|error| ResourceReadError::Internal(error.into()))?;
             json!({
                 "id": id,
                 "path": capture_path.to_string_lossy(),
@@ -135,7 +452,7 @@ fn read_capture_resource_text_sync(uri: &str, captures_dir: Option<&Path>) -> Re
             })
         }
         CaptureResource::Events(id) => {
-            let capture_path = find_capture_by_id(&dir, &id)?;
+            let capture_path = find_capture_by_id(&dir, &id).map_err(map_lookup_error)?;
             json!({
                 "id": id,
                 "path": capture_path.to_string_lossy(),
@@ -143,7 +460,7 @@ fn read_capture_resource_text_sync(uri: &str, captures_dir: Option<&Path>) -> Re
             })
         }
         CaptureResource::Counters(id) => {
-            let capture_path = find_capture_by_id(&dir, &id)?;
+            let capture_path = find_capture_by_id(&dir, &id).map_err(map_lookup_error)?;
             json!({
                 "id": id,
                 "path": capture_path.to_string_lossy(),
@@ -152,7 +469,18 @@ fn read_capture_resource_text_sync(uri: &str, captures_dir: Option<&Path>) -> Re
         }
     };
 
-    Ok(serde_json::to_string_pretty(&payload)?)
+    serde_json::to_string_pretty(&payload)
+        .map_err(|error| ResourceReadError::Internal(error.into()))
+}
+
+fn map_lookup_error(error: CaptureLookupError) -> ResourceReadError {
+    match error {
+        CaptureLookupError::InvalidId(message) | CaptureLookupError::Ambiguous(message) => {
+            ResourceReadError::InvalidRequest(message)
+        }
+        CaptureLookupError::NotFound(message) => ResourceReadError::NotFound(message),
+        CaptureLookupError::Internal(error) => ResourceReadError::Internal(error),
+    }
 }
 
 fn has_wpix_extension(path: &Path) -> bool {
@@ -198,10 +526,15 @@ fn deterministic_path_sort(left: &Path, right: &Path) -> std::cmp::Ordering {
         .then_with(|| left.cmp(&right))
 }
 
-fn require_unique_match(id: &str, matches: &[PathBuf]) -> Result<PathBuf> {
+fn require_unique_match(
+    id: &str,
+    matches: &[PathBuf],
+) -> std::result::Result<PathBuf, CaptureLookupError> {
     match matches {
         [path] => Ok(path.clone()),
-        [] => Err(anyhow::anyhow!("Capture not found: {}", id)),
+        [] => Err(CaptureLookupError::NotFound(format!(
+            "Capture not found: {id}"
+        ))),
         paths => {
             let names = paths
                 .iter()
@@ -209,11 +542,9 @@ fn require_unique_match(id: &str, matches: &[PathBuf]) -> Result<PathBuf> {
                 .map(|name| name.to_string_lossy())
                 .collect::<Vec<_>>()
                 .join(", ");
-            Err(anyhow::anyhow!(
-                "Capture ID is ambiguous: {}. Matches: {}",
-                id,
-                names
-            ))
+            Err(CaptureLookupError::Ambiguous(format!(
+                "Capture ID is ambiguous: {id}. Matches: {names}"
+            )))
         }
     }
 }
@@ -221,34 +552,45 @@ fn require_unique_match(id: &str, matches: &[PathBuf]) -> Result<PathBuf> {
 /// Find a capture file by filename/stem or an unambiguous partial stem match.
 /// Paths are deliberately forbidden: a `capture://` resource cannot escape its
 /// configured capture directory.
-fn find_capture_by_id(dir: &Path, id: &str) -> Result<PathBuf> {
-    validate_capture_id(id)?;
-    let canonical_dir = std::fs::canonicalize(dir)
-        .with_context(|| format!("Capture directory does not exist: {}", dir.display()))?;
+fn find_capture_by_id(dir: &Path, id: &str) -> std::result::Result<PathBuf, CaptureLookupError> {
+    validate_capture_id(id).map_err(|error| CaptureLookupError::InvalidId(error.to_string()))?;
+    let canonical_dir = std::fs::canonicalize(dir).map_err(|error| {
+        CaptureLookupError::Internal(anyhow::Error::new(error).context(format!(
+            "Capture directory does not exist: {}",
+            dir.display()
+        )))
+    })?;
     if !canonical_dir.is_dir() {
-        return Err(anyhow::anyhow!(
+        return Err(CaptureLookupError::Internal(anyhow::anyhow!(
             "Capture directory is not a directory: {}",
             canonical_dir.display()
-        ));
+        )));
     }
 
     let mut captures = Vec::new();
-    for (index, entry) in std::fs::read_dir(&canonical_dir)?.enumerate() {
+    let entries = std::fs::read_dir(&canonical_dir)
+        .map_err(|error| CaptureLookupError::Internal(error.into()))?;
+    for (index, entry) in entries.enumerate() {
         if index >= MAX_CAPTURE_DIRECTORY_ENTRIES {
-            return Err(anyhow::anyhow!(
+            return Err(CaptureLookupError::Internal(anyhow::anyhow!(
                 "Capture directory contains more than {} entries; choose a narrower directory",
                 MAX_CAPTURE_DIRECTORY_ENTRIES
-            ));
+            )));
         }
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
+        let entry = entry.map_err(|error| CaptureLookupError::Internal(error.into()))?;
+        if !entry
+            .file_type()
+            .map_err(|error| CaptureLookupError::Internal(error.into()))?
+            .is_file()
+        {
             continue;
         }
         let path = entry.path();
         if !has_wpix_extension(&path) {
             continue;
         }
-        let path = std::fs::canonicalize(path)?;
+        let path = std::fs::canonicalize(path)
+            .map_err(|error| CaptureLookupError::Internal(error.into()))?;
         if path.starts_with(&canonical_dir) {
             captures.push(path);
         }
@@ -278,7 +620,9 @@ fn find_capture_by_id(dir: &Path, id: &str) -> Result<PathBuf> {
         return require_unique_match(id, &exact_matches);
     }
     if explicit_filename {
-        return Err(anyhow::anyhow!("Capture not found: {}", id));
+        return Err(CaptureLookupError::NotFound(format!(
+            "Capture not found: {id}"
+        )));
     }
 
     let needle = requested_stem.to_lowercase();
@@ -393,6 +737,112 @@ mod tests {
         std::fs::write(dir.join("scene-old.wpix"), b"old").expect("write capture");
 
         assert!(find_capture_by_id(&dir, "scene.wpix").is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn resource_read_errors_preserve_protocol_taxonomy() {
+        let dir = test_directory("taxonomy");
+        std::fs::write(dir.join("scene-a.wpix"), b"a").expect("write capture");
+        std::fs::write(dir.join("scene-b.wpix"), b"b").expect("write capture");
+
+        let invalid = read_capture_resource_text("https://example.test/capture", Some(&dir))
+            .await
+            .expect_err("unsupported URI is invalid");
+        assert!(matches!(invalid, ResourceReadError::InvalidRequest(_)));
+
+        let missing = read_capture_resource_text("capture://missing", Some(&dir))
+            .await
+            .expect_err("missing capture");
+        assert!(matches!(missing, ResourceReadError::NotFound(_)));
+
+        let ambiguous = read_capture_resource_text("capture://scene", Some(&dir))
+            .await
+            .expect_err("ambiguous capture ID");
+        assert!(matches!(ambiguous, ResourceReadError::InvalidRequest(_)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn local_artifact_links_are_registered_and_readable() {
+        let dir = test_directory("artifact");
+        let artifact = dir.join("events.csv");
+        std::fs::write(&artifact, b"Name,Duration\nDraw,1\n").expect("write artifact");
+
+        let registry = ArtifactRegistry::default();
+        let resource = local_artifact_resource(&registry, &artifact, "PIX event list", "text/csv")
+            .expect("artifact resource");
+        assert!(resource.uri.starts_with("artifact://local/"));
+        assert_eq!(resource.name, "events.csv");
+        assert_eq!(resource.mime_type.as_deref(), Some("text/csv"));
+        assert_eq!(resource.size, Some(21));
+        let annotations = resource.annotations.expect("artifact annotations");
+        assert_eq!(annotations.audience, Some(vec![Role::Assistant]));
+        assert_eq!(annotations.priority, Some(0.9));
+        assert!(annotations.last_modified.is_some());
+
+        let payload = read_artifact_resource(&registry, &resource.uri)
+            .await
+            .expect("read registered artifact");
+        match payload {
+            ArtifactPayload::Text { text, mime_type } => {
+                assert_eq!(mime_type, "text/csv");
+                assert_eq!(text, "Name,Duration\nDraw,1\n");
+            }
+            ArtifactPayload::Blob { .. } => panic!("CSV should be a text resource"),
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn binary_capture_link_resolves_to_bounded_descriptor() {
+        let dir = test_directory("capture-artifact");
+        let artifact = dir.join("frame.wpix");
+        std::fs::write(&artifact, b"capture").expect("write capture artifact");
+        let registry = ArtifactRegistry::default();
+        let resource = local_artifact_resource(
+            &registry,
+            &artifact,
+            "PIX GPU capture",
+            "application/octet-stream",
+        )
+        .expect("capture resource");
+        assert_eq!(resource.mime_type.as_deref(), Some("application/json"));
+        assert_eq!(resource.size, None);
+
+        let payload = read_artifact_resource(&registry, &resource.uri)
+            .await
+            .expect("read capture descriptor");
+        match payload {
+            ArtifactPayload::Text { text, mime_type } => {
+                assert_eq!(mime_type, "application/json");
+                assert!(text.contains("frame.wpix"));
+                assert!(text.contains("application/octet-stream"));
+            }
+            ArtifactPayload::Blob { .. } => panic!("capture should use a descriptor"),
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn resource_catalog_lists_capture_metadata_and_annotations() {
+        let dir = test_directory("catalog");
+        std::fs::write(dir.join("Frame One.wpix"), b"capture").expect("write capture");
+
+        let resources = list_capture_resources(Some(&dir))
+            .await
+            .expect("capture catalog");
+        assert_eq!(resources.len(), 2);
+        assert_eq!(resources[0].uri, "capture://list");
+        assert_eq!(resources[1].uri, "capture://Frame%20One%2Ewpix");
+        assert_eq!(resources[1].size, Some(7));
+        assert_eq!(
+            resources[1]
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.audience.clone()),
+            Some(vec![Role::Assistant])
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

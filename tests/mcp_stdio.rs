@@ -139,6 +139,7 @@ fn stdio_task_fallback_and_elicitation_cancellation_are_protocol_compliant() {
     assert_eq!(initialize["id"], json!(1));
     assert_eq!(initialize["result"]["protocolVersion"], "2025-11-25");
     assert!(initialize["result"]["capabilities"]["tasks"].is_null());
+    assert!(initialize["result"]["capabilities"]["resources"]["listChanged"].is_null());
     session.send(json!({
         "jsonrpc": "2.0",
         "method": "notifications/initialized",
@@ -188,6 +189,92 @@ fn stdio_task_fallback_and_elicitation_cancellation_are_protocol_compliant() {
     let task_call = session.receive_until(|message| message["id"] == json!(2));
     assert!(task_call.get("error").is_none(), "{task_call}");
     assert!(task_call["result"]["structuredContent"].is_object());
+
+    // Discovery is deterministic, annotated, and rejects cursors for
+    // unpaginated endpoints rather than silently returning duplicate pages.
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 20,
+        "method": "tools/list",
+        "params": {}
+    }));
+    let tools = session.receive_until(|message| message["id"] == json!(20));
+    let names: Vec<_> = tools["result"]["tools"]
+        .as_array()
+        .expect("tool array")
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("tool name"))
+        .collect();
+    assert!(names.windows(2).all(|pair| pair[0] <= pair[1]));
+
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 21,
+        "method": "tools/list",
+        "params": { "cursor": "not-a-tool-cursor" }
+    }));
+    let bad_tool_cursor = session.receive_until(|message| message["id"] == json!(21));
+    assert_eq!(bad_tool_cursor["error"]["code"], json!(-32602));
+
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 22,
+        "method": "resources/list",
+        "params": {}
+    }));
+    let resources = session.receive_until(|message| message["id"] == json!(22));
+    assert_eq!(resources["result"]["resources"][0]["uri"], "capture://list");
+    assert_eq!(
+        resources["result"]["resources"][0]["annotations"]["audience"][0],
+        "assistant"
+    );
+
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 23,
+        "method": "resources/list",
+        "params": { "cursor": "not-a-resource-cursor" }
+    }));
+    let bad_resource_cursor = session.receive_until(|message| message["id"] == json!(23));
+    assert_eq!(bad_resource_cursor["error"]["code"], json!(-32602));
+
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 24,
+        "method": "resources/read",
+        "params": { "uri": "https://example.test/not-a-pix-resource" }
+    }));
+    let invalid_resource = session.receive_until(|message| message["id"] == json!(24));
+    assert_eq!(invalid_resource["error"]["code"], json!(-32602));
+
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 25,
+        "method": "resources/read",
+        "params": { "uri": "capture://definitely-missing-pix-mcp-test" }
+    }));
+    let missing_resource = session.receive_until(|message| message["id"] == json!(25));
+    assert_eq!(missing_resource["error"]["code"], json!(-32002));
+
+    // A matching progress token produces optional MCP progress even if the
+    // operation then fails as a normal, caller-visible tool error.
+    session.send(json!({
+        "jsonrpc": "2.0",
+        "id": 26,
+        "method": "tools/call",
+        "params": {
+            "name": "pix_run_analysis",
+            "arguments": { "capture_path": "definitely-missing.wpix" },
+            "_meta": { "progressToken": "pix-progress-test" }
+        }
+    }));
+    let progress = session.receive_until(|message| {
+        message["method"] == "notifications/progress"
+            && message["params"]["progressToken"] == "pix-progress-test"
+    });
+    assert_eq!(progress["params"]["progress"], json!(0.0));
+    let progressed_call = session.receive_until(|message| message["id"] == json!(26));
+    assert_eq!(progressed_call["result"]["isError"], json!(true));
 
     session.send(json!({
         "jsonrpc": "2.0",
