@@ -25,6 +25,8 @@ static PIXTOOL_BACKGROUND_CONCURRENCY: Semaphore = Semaphore::const_new(4);
 const PIXTOOL_OPERATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const PIXTOOL_LAUNCH_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const PIXTOOL_TIMING_GRACE: Duration = Duration::from_secs(30);
+const PIXTOOL_PROGRAMMATIC_CAPTURE_DEFAULT_TIMEOUT_SECS: u32 = 10 * 60;
+const PIXTOOL_PROGRAMMATIC_CAPTURE_MAX_TIMEOUT_SECS: u32 = 30 * 60;
 const MAX_PROCESS_OUTPUT_BYTES: usize = 1024 * 1024;
 pub(crate) const PROCESS_OUTPUT_DIAGNOSTIC_PREFIX: &str = "[pix-mcp:";
 pub(crate) const PROCESS_OUTPUT_TRUNCATION_MARKER: &str = "[pix-mcp: process output truncated]";
@@ -219,6 +221,71 @@ async fn join_output_reader(
 
 /// Wrapper for pixtool.exe operations
 pub struct PixTool;
+
+/// Validated options for PIX's `take-new-timing-capture` command.
+///
+/// Boolean fields describe the effective capture contents. PIX expresses
+/// disabled streams as negative command-line switches (`--noCpuSamples`,
+/// `--noCallstacks`, and `--noGpuTimings`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimingCaptureOptions {
+    pub duration_ms: u32,
+    /// Explicit sampling-rate override. `None` uses PIX's documented default
+    /// of 1000 samples/second when CPU samples are enabled.
+    pub sample_rate: Option<u32>,
+    pub cpu_samples: bool,
+    pub callstacks: bool,
+    pub gpu_timings: bool,
+}
+
+impl TimingCaptureOptions {
+    pub fn new(
+        duration_ms: Option<u32>,
+        sample_rate: Option<u32>,
+        cpu_samples: bool,
+        callstacks: bool,
+        gpu_timings: bool,
+    ) -> Result<Self> {
+        let duration_ms = validate_duration(duration_ms)?;
+        if sample_rate.is_some_and(|rate| !(1..=8_000).contains(&rate)) {
+            return Err(anyhow!("sample_rate must be between 1 and 8000"));
+        }
+        if !cpu_samples && sample_rate.is_some() {
+            return Err(anyhow!(
+                "sample_rate cannot be set when CPU samples are disabled"
+            ));
+        }
+        Ok(Self {
+            duration_ms,
+            sample_rate,
+            cpu_samples,
+            callstacks,
+            gpu_timings,
+        })
+    }
+
+    pub fn effective_sample_rate(&self) -> Option<u32> {
+        self.cpu_samples
+            .then_some(self.sample_rate.unwrap_or(1_000))
+    }
+
+    fn command_arguments(&self) -> Vec<String> {
+        let mut arguments = vec![format!("--duration={}", self.duration_ms)];
+        if let Some(sample_rate) = self.sample_rate {
+            arguments.push(format!("--sampleRate={sample_rate}"));
+        }
+        if !self.cpu_samples {
+            arguments.push("--noCpuSamples".to_string());
+        }
+        if !self.callstacks {
+            arguments.push("--noCallstacks".to_string());
+        }
+        if !self.gpu_timings {
+            arguments.push("--noGpuTimings".to_string());
+        }
+        arguments
+    }
+}
 
 /// Format a `--option="value"` pixtool argument with the value wrapped in
 /// literal double quotes.
@@ -808,9 +875,10 @@ impl PixTool {
 
         let message = format!(
             "Launched {} under pixtool (pixtool PID: {} — this is the launcher process, not \
-             the game). For a programmatic GPU capture use pix_gpu_capture_launch or \
-             pix_capture_and_analyze: PIX can only GPU-capture a process it launched itself, \
-             so attaching by PID to a separately-started game will fail.",
+             the game). Use pix_gpu_capture_launch for the next presented frame, or \
+             pix_programmatic_capture when the application triggers the exact region. PIX can \
+             only GPU-capture a process it launched itself, so attaching by PID to a \
+             separately-started game will fail.",
             exe_path.display(),
             pid
         );
@@ -1067,16 +1135,82 @@ impl PixTool {
         }
     }
 
+    /// Launch an instrumented application, wait for its next in-process PIX
+    /// capture trigger, and save that deterministic capture.
+    ///
+    /// Uses: `pixtool launch <exe> programmatic-capture save-capture <file.wpix>`.
+    pub async fn programmatic_capture_launch(
+        exe_path: &Path,
+        args: &[&str],
+        output_path: &Path,
+        working_dir: Option<&Path>,
+        timeout_seconds: Option<u32>,
+    ) -> Result<CaptureResult> {
+        security::ensure_user_launch_allowed()?;
+        let exe_path = validate_executable(exe_path)?;
+        let working_dir = validate_working_directory(working_dir)?;
+        let pending_output = PendingCaptureOutput::new(output_path)?;
+        let command_line = validate_command_line_args(args)?;
+        let timeout_seconds =
+            timeout_seconds.unwrap_or(PIXTOOL_PROGRAMMATIC_CAPTURE_DEFAULT_TIMEOUT_SECS);
+        if !(1..=PIXTOOL_PROGRAMMATIC_CAPTURE_MAX_TIMEOUT_SECS).contains(&timeout_seconds) {
+            return Err(anyhow!(
+                "timeout_seconds must be between 1 and {}",
+                PIXTOOL_PROGRAMMATIC_CAPTURE_MAX_TIMEOUT_SECS
+            ));
+        }
+        let pixtool = Self::find()?;
+
+        let mut cmd = Command::new(&pixtool);
+        cmd.arg("launch").arg(&exe_path);
+        if let Some(command_line) = command_line.as_deref() {
+            push_value_option(&mut cmd, "--command-line", command_line)?;
+        }
+        if let Some(dir) = working_dir.as_deref() {
+            push_value_option(&mut cmd, "--working-directory", &dir.display().to_string())?;
+        }
+        cmd.arg("programmatic-capture")
+            .arg("save-capture")
+            .arg(pending_output.path());
+
+        let output = run_pixtool_command(
+            cmd,
+            Duration::from_secs(u64::from(timeout_seconds)),
+            "pixtool programmatic GPU capture",
+        )
+        .await?;
+
+        if output.status.success() {
+            let output_path = pending_output.verify_and_persist()?;
+            return Ok(CaptureResult {
+                output_path: output_path.clone(),
+                message: format!(
+                    "Programmatic GPU capture saved to {} after the application triggered PIX",
+                    output_path.display()
+                ),
+                stdout: public_process_output(&output.stdout),
+            });
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Err(anyhow!(
+            "pixtool programmatic capture failed. The target must be instrumented to invoke a \
+             PIX programmatic capture while this call is waiting.\nstderr: {}\nstdout: {}",
+            security::sanitize_process_output(&stderr),
+            security::sanitize_process_output(&stdout)
+        ))
+    }
+
     /// Take a timing capture of a running process
-    /// Uses: pixtool attach <PID> take-new-timing-capture <file.wpix> [--duration=<ms>]
+    /// Uses: pixtool attach <PID> take-new-timing-capture <file.wpix> [options]
     pub async fn timing_capture_process(
         process_id: u32,
         output_path: &Path,
-        duration_ms: Option<u32>,
+        options: &TimingCaptureOptions,
     ) -> Result<CaptureResult> {
         validate_process_id(process_id)?;
         let pending_output = PendingCaptureOutput::new(output_path)?;
-        let duration_ms = validate_duration(duration_ms)?;
         let pixtool = Self::find()?;
 
         tracing::info!(process_id, "Starting timing capture");
@@ -1087,11 +1221,10 @@ impl PixTool {
             .arg("take-new-timing-capture")
             .arg(pending_output.path());
 
-        // pixtool's --duration is in milliseconds (default 100), not seconds.
-        cmd.arg(format!("--duration={}", duration_ms));
+        cmd.args(options.command_arguments());
 
-        let timeout_duration =
-            Duration::from_millis(u64::from(duration_ms)).saturating_add(PIXTOOL_TIMING_GRACE);
+        let timeout_duration = Duration::from_millis(u64::from(options.duration_ms))
+            .saturating_add(PIXTOOL_TIMING_GRACE);
         let output = run_pixtool_command(cmd, timeout_duration, "pixtool timing capture").await?;
 
         if output.status.success() {
@@ -1265,6 +1398,37 @@ mod tests {
             natural_compare(OsStr::new("2509.1"), OsStr::new("2603.1")),
             Ordering::Less
         );
+    }
+
+    #[test]
+    fn timing_capture_options_validate_and_emit_documented_switches() {
+        let options = TimingCaptureOptions::new(Some(2_500), Some(8_000), true, false, false)
+            .expect("valid CPU-focused options");
+        assert_eq!(options.effective_sample_rate(), Some(8_000));
+        assert_eq!(
+            options.command_arguments(),
+            [
+                "--duration=2500",
+                "--sampleRate=8000",
+                "--noCallstacks",
+                "--noGpuTimings"
+            ]
+        );
+
+        let gpu_only = TimingCaptureOptions::new(None, None, false, false, true)
+            .expect("valid GPU-only options");
+        assert_eq!(gpu_only.effective_sample_rate(), None);
+        assert_eq!(
+            gpu_only.command_arguments(),
+            ["--duration=100", "--noCpuSamples", "--noCallstacks"]
+        );
+    }
+
+    #[test]
+    fn timing_capture_options_reject_ineffective_sampling_settings() {
+        assert!(TimingCaptureOptions::new(None, Some(1_000), false, false, true).is_err());
+        assert!(TimingCaptureOptions::new(None, Some(8_001), true, true, true).is_err());
+        assert!(TimingCaptureOptions::new(None, None, false, false, false).is_ok());
     }
 
     #[test]
