@@ -1,10 +1,17 @@
 //! Status and health-check logic for the PIX MCP server.
 
+use std::path::Path;
+use std::time::Duration;
+
 use anyhow::Result;
 use rmcp::schemars;
 use serde::Serialize;
+use tokio::process::Command;
 
 use crate::pix::PixTool;
+use crate::pix::pixtool::{PROCESS_OUTPUT_DIAGNOSTIC_PREFIX, run_pixtool_command};
+
+const PIXTOOL_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Availability of a PIX component (e.g. pixtool.exe).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -39,11 +46,17 @@ pub struct StatusReport {
 /// running elevated (required for timing captures).
 pub async fn handle_pix_status() -> Result<StatusReport> {
     let pixtool = match PixTool::find() {
-        Ok(path) => PixComponent {
-            found: true,
-            path: Some(path.to_string_lossy().to_string()),
-            error: None,
-        },
+        Ok(path) => {
+            let probe_error = probe_pixtool(&path)
+                .await
+                .err()
+                .map(|error| error.to_string());
+            PixComponent {
+                found: true,
+                path: Some(path.to_string_lossy().to_string()),
+                error: probe_error,
+            }
+        }
         Err(e) => PixComponent {
             found: false,
             path: None,
@@ -52,7 +65,7 @@ pub async fn handle_pix_status() -> Result<StatusReport> {
     };
 
     let is_admin = is_elevated();
-    let ready = pixtool.found;
+    let ready = pixtool.found && pixtool.error.is_none();
 
     let mut suggestions = Vec::new();
     if !pixtool.found {
@@ -62,6 +75,11 @@ pub async fn handle_pix_status() -> Result<StatusReport> {
                 .to_string(),
         );
         suggestions.push("Or set the PIXTOOL_PATH environment variable to pixtool.exe".to_string());
+    } else if pixtool.error.is_some() {
+        suggestions.push(
+            "The resolved PIXTOOL_PATH could not be verified; point it to a working pixtool.exe"
+                .to_string(),
+        );
     }
     if !is_admin {
         suggestions.push("Run as administrator to enable timing captures".to_string());
@@ -89,6 +107,31 @@ pub async fn handle_pix_status() -> Result<StatusReport> {
     })
 }
 
+async fn probe_pixtool(path: &Path) -> Result<()> {
+    let mut command = Command::new(path);
+    command.args(["--log=off", "--output=quiet", "--help"]);
+    let output =
+        run_pixtool_command(command, PIXTOOL_PROBE_TIMEOUT, "pixtool health check").await?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stdout
+        .lines()
+        .chain(stderr.lines())
+        .any(|line| line.trim().starts_with(PROCESS_OUTPUT_DIAGNOSTIC_PREFIX))
+    {
+        return Err(anyhow::anyhow!(
+            "pixtool health-check output exceeded the server limit"
+        ));
+    }
+    let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    if !combined.contains("usage: pixtool") || !combined.contains("open-capture") {
+        return Err(anyhow::anyhow!(
+            "the resolved executable did not return recognizable pixtool help"
+        ));
+    }
+    Ok(())
+}
+
 /// Check if the current process is running with elevated privileges.
 fn is_elevated() -> bool {
     #[cfg(windows)]
@@ -96,7 +139,7 @@ fn is_elevated() -> bool {
         use std::mem;
         use windows::Win32::Foundation::{CloseHandle, HANDLE};
         use windows::Win32::Security::{
-            GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+            GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
         };
         use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 

@@ -19,6 +19,7 @@ use crate::pix::PixTool;
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GpuCaptureArgs {
     /// Process ID (PID) of the running DX12 application to capture.
+    #[schemars(range(min = 1))]
     pub process_id: u32,
     /// Path to save the capture file (.wpix extension).
     #[serde(default)]
@@ -38,22 +39,23 @@ pub struct GpuCaptureLaunchArgs {
     /// Working directory for the executable.
     #[serde(default)]
     pub working_dir: Option<String>,
-    /// Bound the capture to this many frames (e.g. 1). Recommended so pixtool
-    /// finishes promptly and closes the launched app instead of running until
-    /// the app exits.
+    /// Bound the capture to this many frames (default 1, range 1..=120).
     #[serde(default)]
+    #[schemars(range(min = 1, max = 120))]
     pub frames: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TimingCaptureArgs {
     /// Process ID (PID) of the running application to capture.
+    #[schemars(range(min = 1))]
     pub process_id: u32,
     /// Path to save the capture file (.wpix extension).
     #[serde(default)]
     pub output_path: Option<String>,
-    /// Duration of the timing capture in milliseconds (pixtool default: 100).
+    /// Duration in milliseconds (default 100, range 1..=600000).
     #[serde(default)]
+    #[schemars(range(min = 1, max = 600000))]
     pub duration_ms: Option<u32>,
 }
 
@@ -62,6 +64,13 @@ pub struct ListCapturesArgs {
     /// Directory to search for capture files (defaults to the current directory).
     #[serde(default)]
     pub directory: Option<String>,
+    /// Zero-based result offset (default 0).
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Maximum captures to return (default 100, maximum 500).
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 500))]
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -96,6 +105,14 @@ pub struct CaptureEntry {
 pub struct CaptureListReport {
     pub success: bool,
     pub directory: String,
+    /// Total captures found before pagination.
+    pub total_count: usize,
+    pub offset: usize,
+    pub returned: usize,
+    pub truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
+    /// Number of captures in this response (kept for compatibility).
     pub count: usize,
     pub captures: Vec<CaptureEntry>,
 }
@@ -107,12 +124,26 @@ pub struct MessageReport {
     pub message: String,
 }
 
-/// Ensure the given path ends with a `.wpix` extension.
-fn ensure_wpix(path: PathBuf) -> PathBuf {
-    if path.extension().is_none_or(|e| e != "wpix") {
-        path.with_extension("wpix")
-    } else {
-        path
+/// Normalize an output with no extension, while rejecting directories and a
+/// conflicting extension instead of silently writing to a different path.
+pub(super) fn normalize_wpix_output(raw: &str, label: &str) -> Result<PathBuf> {
+    if raw.trim().is_empty() {
+        return Err(anyhow::anyhow!("{label} must not be empty"));
+    }
+    let path = PathBuf::from(raw);
+    if path.is_dir() {
+        return Err(anyhow::anyhow!(
+            "{label} must name a file, not a directory: {}",
+            path.display()
+        ));
+    }
+    match path.extension().and_then(|extension| extension.to_str()) {
+        None => Ok(path.with_extension("wpix")),
+        Some(extension) if extension.eq_ignore_ascii_case("wpix") => Ok(path),
+        Some(_) => Err(anyhow::anyhow!(
+            "{label} must end with .wpix: {}",
+            path.display()
+        )),
     }
 }
 
@@ -122,12 +153,12 @@ fn require_output_path(output_path: Option<String>) -> Result<PathBuf> {
     let raw = output_path.ok_or_else(|| {
         anyhow::anyhow!("output_path is required: provide a path to save the .wpix capture")
     })?;
-    Ok(ensure_wpix(PathBuf::from(raw)))
+    normalize_wpix_output(&raw, "output_path")
 }
 
 pub async fn handle_pix_gpu_capture(args: GpuCaptureArgs) -> Result<CaptureReport> {
     let output_path = require_output_path(args.output_path)?;
-    let result = PixTool::gpu_capture_process(args.process_id, &output_path)?;
+    let result = PixTool::gpu_capture_process(args.process_id, &output_path).await?;
 
     Ok(CaptureReport {
         success: true,
@@ -151,7 +182,8 @@ pub async fn handle_pix_gpu_capture_launch(args: GpuCaptureLaunchArgs) -> Result
         &output_path,
         working_dir.as_deref(),
         args.frames,
-    )?;
+    )
+    .await?;
 
     Ok(CaptureReport {
         success: true,
@@ -164,7 +196,8 @@ pub async fn handle_pix_gpu_capture_launch(args: GpuCaptureLaunchArgs) -> Result
 
 pub async fn handle_pix_timing_capture(args: TimingCaptureArgs) -> Result<CaptureReport> {
     let output_path = require_output_path(args.output_path)?;
-    let result = PixTool::timing_capture_process(args.process_id, &output_path, args.duration_ms)?;
+    let result =
+        PixTool::timing_capture_process(args.process_id, &output_path, args.duration_ms).await?;
 
     Ok(CaptureReport {
         success: true,
@@ -176,14 +209,30 @@ pub async fn handle_pix_timing_capture(args: TimingCaptureArgs) -> Result<Captur
 }
 
 pub async fn handle_pix_list_captures(args: ListCapturesArgs) -> Result<CaptureListReport> {
-    let directory = args
-        .directory
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    const MAX_LIMIT: usize = 500;
+    let limit = args.limit.unwrap_or(100);
+    if limit == 0 || limit > MAX_LIMIT {
+        return Err(anyhow::anyhow!("limit must be between 1 and {MAX_LIMIT}"));
+    }
+    let offset = args.offset.unwrap_or(0);
+    let directory = match args.directory {
+        Some(directory) if directory.trim().is_empty() => {
+            return Err(anyhow::anyhow!("directory must not be empty"));
+        }
+        Some(directory) => PathBuf::from(directory),
+        None => std::env::current_dir()?,
+    };
 
-    let captures = PixTool::list_captures(&directory)?;
+    let scan_directory = directory.clone();
+    let captures = tokio::task::spawn_blocking(move || PixTool::list_captures(&scan_directory))
+        .await
+        .map_err(|error| anyhow::anyhow!("Capture directory scan task failed: {error}"))??;
+    let total_count = captures.len();
+    let offset = offset.min(total_count);
     let entries: Vec<CaptureEntry> = captures
         .iter()
+        .skip(offset)
+        .take(limit)
         .map(|c| CaptureEntry {
             path: c.path.to_string_lossy().to_string(),
             name: c.name.clone(),
@@ -194,11 +243,19 @@ pub async fn handle_pix_list_captures(args: ListCapturesArgs) -> Result<CaptureL
                 .map(|d| d.as_secs()),
         })
         .collect();
+    let returned = entries.len();
+    let next = offset.saturating_add(returned);
+    let truncated = next < total_count;
 
     Ok(CaptureListReport {
         success: true,
         directory: directory.to_string_lossy().to_string(),
-        count: entries.len(),
+        total_count,
+        offset,
+        returned,
+        truncated,
+        next_offset: truncated.then_some(next),
+        count: returned,
         captures: entries,
     })
 }
@@ -213,10 +270,56 @@ pub async fn handle_pix_open_capture(args: OpenCaptureArgs) -> Result<MessageRep
         ));
     }
 
-    PixTool::open_capture(&capture_path)?;
+    PixTool::open_capture(&capture_path).await?;
 
     Ok(MessageReport {
         success: true,
         message: format!("Opened capture in PIX: {}", capture_path.display()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wpix_output_normalization_rejects_directories_and_conflicting_extensions() {
+        let directory = tempfile::tempdir().expect("test directory");
+        assert!(normalize_wpix_output(&directory.path().to_string_lossy(), "output_path").is_err());
+        assert!(normalize_wpix_output("capture.png", "output_path").is_err());
+        assert_eq!(
+            normalize_wpix_output("capture", "output_path").expect("append extension"),
+            PathBuf::from("capture.wpix")
+        );
+        assert_eq!(
+            normalize_wpix_output("capture.WPIX", "output_path").expect("accept extension"),
+            PathBuf::from("capture.WPIX")
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_listing_is_paginated_and_reports_the_total() {
+        let directory = tempfile::tempdir().expect("test directory");
+        for name in ["one.wpix", "two.wpix", "three.wpix"] {
+            std::fs::write(directory.path().join(name), b"capture").expect("write capture");
+        }
+        std::fs::write(directory.path().join("ignored.txt"), b"not a capture")
+            .expect("write ignored file");
+
+        let report = handle_pix_list_captures(ListCapturesArgs {
+            directory: Some(directory.path().to_string_lossy().into_owned()),
+            offset: Some(1),
+            limit: Some(1),
+        })
+        .await
+        .expect("list captures");
+
+        assert_eq!(report.total_count, 3);
+        assert_eq!(report.offset, 1);
+        assert_eq!(report.returned, 1);
+        assert_eq!(report.count, 1);
+        assert!(report.truncated);
+        assert_eq!(report.next_offset, Some(2));
+        assert_eq!(report.captures.len(), 1);
+    }
 }

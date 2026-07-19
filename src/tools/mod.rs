@@ -8,28 +8,28 @@ mod status;
 mod workflow;
 
 use anyhow::Result as AnyResult;
-use std::sync::Arc;
-
 use rmcp::{
-    elicit_safe,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    ErrorData as McpError, Json, RoleServer, ServerHandler, elicit_safe,
+    handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
     model::*,
     schemars,
-    service::RequestContext,
-    task_handler,
-    task_manager::OperationProcessor,
-    tool, tool_handler, tool_router, ErrorData as McpError, Json, RoleServer, ServerHandler,
+    service::{ElicitationMode, PeerRequestOptions, RequestContext, RequestHandle},
+    tool, tool_router,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 
 /// The PIX MCP server. Tools are registered through the `#[tool_router]` macro.
 #[derive(Clone)]
 pub struct PixServer {
     tool_router: ToolRouter<Self>,
-    /// Backs MCP task support (`#[task_handler]`): long-running tools may be
-    /// invoked as durable tasks and polled by the client.
-    processor: Arc<Mutex<OperationProcessor>>,
+}
+
+/// Service wrapper that normalizes task-augmented tool calls to direct calls.
+/// rmcp 2.2 otherwise rejects/enqueues them even when the server correctly
+/// omits the Tasks capability, contrary to the MCP fallback requirement.
+#[derive(Clone)]
+pub struct PixService {
+    server: PixServer,
 }
 
 impl Default for PixServer {
@@ -42,7 +42,8 @@ impl Default for PixServer {
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[schemars(description = "Destination file path")]
 struct OutputPathRequest {
-    /// Absolute path for the output file.
+    /// Path for the output file (absolute paths are recommended).
+    #[schemars(length(min = 1))]
     output_path: String,
 }
 elicit_safe!(OutputPathRequest);
@@ -55,6 +56,43 @@ fn done<T>(result: AnyResult<T>) -> Result<Json<T>, String> {
     result.map(Json).map_err(|e| e.to_string())
 }
 
+/// Build the mixed image/structured response used by `pix_get_screenshot`.
+/// The JSON text mirrors `structuredContent` for clients that only consume
+/// content blocks.
+fn screenshot_call_result(res: analysis::ScreenshotResult) -> Result<CallToolResult, McpError> {
+    let structured_content = serde_json::to_value(&res.report).map_err(|e| {
+        McpError::internal_error(format!("Failed to serialize screenshot report: {e}"), None)
+    })?;
+
+    let mut result = CallToolResult::structured(structured_content);
+    if let Some(b64) = res.image_b64 {
+        result
+            .content
+            .insert(0, ContentBlock::image(b64, "image/png"));
+    }
+    Ok(result)
+}
+
+async fn cancel_peer_request(handle: RequestHandle<RoleServer>, reason: &'static str) {
+    // Spawn before awaiting so cancellation forwarding survives if the outer
+    // tool dispatcher drops this future at the same cancellation boundary.
+    let cancellation = tokio::spawn(handle.cancel(Some(reason.to_string())));
+    match tokio::time::timeout(std::time::Duration::from_secs(1), cancellation).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error))) => {
+            tracing::warn!(%error, "Failed to forward child request cancellation");
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "Child request cancellation task failed");
+        }
+        Err(_) => {
+            // Dropping a Tokio JoinHandle detaches the task, so it may still
+            // complete once the transport accepts another outbound message.
+            tracing::warn!("Timed out while forwarding child request cancellation");
+        }
+    }
+}
+
 /// Resolve an output path, asking the client via elicitation when it is missing.
 /// Returns an actionable tool error if no path can be obtained.
 async fn resolve_output_path(
@@ -63,20 +101,83 @@ async fn resolve_output_path(
     prompt: &str,
 ) -> Result<String, String> {
     if let Some(p) = provided {
+        if p.trim().is_empty() {
+            return Err("output_path must not be empty.".to_string());
+        }
         return Ok(p);
     }
-    match ctx
+    if !ctx
         .peer
-        .elicit::<OutputPathRequest>(prompt.to_string())
-        .await
+        .supported_elicitation_modes()
+        .contains(&ElicitationMode::Form)
     {
-        Ok(Some(r)) => Ok(r.output_path),
-        Ok(None) => {
-            Err("Output path not provided (elicitation declined). Please pass output_path."
-                .to_string())
+        return Err(
+            "output_path is required; the client does not support form elicitation. Please pass output_path."
+                .to_string(),
+        );
+    }
+
+    let requested_schema = ElicitationSchema::from_type::<OutputPathRequest>()
+        .map_err(|error| format!("Could not build the output-path form schema: {error}"))?;
+    let request = ServerRequest::ElicitRequest(ElicitRequest::new(
+        ElicitRequestParams::FormElicitationParams {
+            meta: None,
+            message: prompt.to_string(),
+            requested_schema,
+        },
+    ));
+    let mut handle = ctx
+        .peer
+        .send_cancellable_request(request, PeerRequestOptions::no_options())
+        .await
+        .map_err(|error| format!("Could not request output_path from the client: {error}"))?;
+
+    let response = tokio::select! {
+        biased;
+        _ = ctx.ct.cancelled() => {
+            cancel_peer_request(handle, "parent tool request cancelled").await;
+            return Err("Output-path elicitation was cancelled with the tool request.".to_string());
         }
-        Err(_) => Err(
-            "output_path is required; the client does not support elicitation. Please pass output_path."
+        _ = tokio::time::sleep(std::time::Duration::from_secs(5 * 60)) => {
+            cancel_peer_request(handle, "output-path elicitation timed out").await;
+            return Err("Output-path elicitation timed out after 5 minutes. Please pass output_path.".to_string());
+        }
+        response = &mut handle.rx => response,
+    }
+    .map_err(|_| "The client connection closed during output-path elicitation.".to_string())?
+    .map_err(|error| format!("Output-path elicitation failed: {error}"))?;
+
+    let result = match response {
+        ClientResult::ElicitResult(result) => result,
+        _ => {
+            return Err(
+                "Client returned an unexpected response to output-path elicitation.".to_string(),
+            );
+        }
+    };
+    match result.action {
+        ElicitationAction::Accept => {
+            let content = result.content.ok_or_else(|| {
+                "The client accepted output-path elicitation without providing content. Please pass output_path."
+                    .to_string()
+            })?;
+            let response: OutputPathRequest = serde_json::from_value(content).map_err(|error| {
+                format!("The elicited output_path could not be parsed: {error}")
+            })?;
+            if response.output_path.trim().is_empty() {
+                Err("The elicited output_path was empty. Please provide a valid path.".to_string())
+            } else {
+                Ok(response.output_path)
+            }
+        }
+        ElicitationAction::Decline => {
+            Err("Output-path elicitation was declined. Please pass output_path.".to_string())
+        }
+        ElicitationAction::Cancel => {
+            Err("Output-path elicitation was cancelled. Please pass output_path.".to_string())
+        }
+        _ => Err(
+            "Client returned an unsupported output-path elicitation action. Please pass output_path."
                 .to_string(),
         ),
     }
@@ -87,7 +188,6 @@ impl PixServer {
     pub fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
-            processor: Arc::new(Mutex::new(OperationProcessor::new())),
         }
     }
 
@@ -135,8 +235,7 @@ impl PixServer {
                        .wpix file. IMPORTANT: PIX can only GPU-capture a process it launched \
                        itself; attaching to an independently-started game fails with PIXTOOL17. \
                        For a normal game, prefer pix_gpu_capture_launch or pix_capture_and_analyze.",
-        annotations(title = "GPU capture (PID)"),
-        execution(task_support = "optional")
+        annotations(title = "GPU capture (PID)", destructive_hint = true)
     )]
     async fn pix_gpu_capture(
         &self,
@@ -157,8 +256,7 @@ impl PixServer {
     #[tool(
         name = "pix_gpu_capture_launch",
         description = "Launch an executable and capture GPU frames to a .wpix file via pixtool.exe.",
-        annotations(title = "Launch + GPU capture", destructive_hint = true),
-        execution(task_support = "optional")
+        annotations(title = "Launch + GPU capture", destructive_hint = true)
     )]
     async fn pix_gpu_capture_launch(
         &self,
@@ -180,8 +278,7 @@ impl PixServer {
         name = "pix_timing_capture",
         description = "Take a timing capture of a running process (CPU/GPU timing). Requires \
                        administrator privileges.",
-        annotations(title = "Timing capture (PID)"),
-        execution(task_support = "optional")
+        annotations(title = "Timing capture (PID)", destructive_hint = true)
     )]
     async fn pix_timing_capture(
         &self,
@@ -201,7 +298,7 @@ impl PixServer {
 
     #[tool(
         name = "pix_list_captures",
-        description = "List all PIX capture files (.wpix) in a directory.",
+        description = "List PIX capture files (.wpix) in a directory with offset/limit pagination.",
         annotations(title = "List captures", read_only_hint = true)
     )]
     async fn pix_list_captures(
@@ -227,8 +324,7 @@ impl PixServer {
         name = "pix_analyze_capture",
         description = "Analyze a .wpix capture: extract the event list (and optionally counters) \
                        and return structured analysis results.",
-        annotations(title = "Analyze capture", read_only_hint = true),
-        execution(task_support = "optional")
+        annotations(title = "Analyze capture", read_only_hint = true)
     )]
     async fn pix_analyze_capture(
         &self,
@@ -242,8 +338,7 @@ impl PixServer {
         description = "Heuristic frame triage from a capture: draw/dispatch/barrier counts, \
                        render-target changes, and the most expensive GPU events. Great first step \
                        for performance debugging.",
-        annotations(title = "Analyze frame", read_only_hint = true),
-        execution(task_support = "optional")
+        annotations(title = "Analyze frame", read_only_hint = true)
     )]
     async fn pix_analyze_frame(
         &self,
@@ -257,8 +352,7 @@ impl PixServer {
         description = "Extract the event list (D3D12 API calls, draw calls, GPU events) from a \
                        capture. Returns a paginated slice (offset/limit/response_format) or saves \
                        the full CSV when output_path is given.",
-        annotations(title = "Get event list", read_only_hint = true),
-        execution(task_support = "optional")
+        annotations(title = "Get event list", destructive_hint = true)
     )]
     async fn pix_get_event_list(
         &self,
@@ -274,8 +368,9 @@ impl PixServer {
                        inspect the render. Set depth=true, marker=<name>, global_id=<id>, or \
                        rtv_index=<n> to instead save a specific render target / depth buffer via \
                        capture replay (save-resource).",
-        annotations(title = "Get screenshot", read_only_hint = true),
-        execution(task_support = "optional")
+        annotations(title = "Get screenshot", destructive_hint = true),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<analysis::ScreenshotReport>()
+            .expect("ScreenshotReport must produce a valid object output schema"),
     )]
     async fn pix_get_screenshot(
         &self,
@@ -290,7 +385,7 @@ impl PixServer {
         .await
         {
             Ok(p) => p,
-            Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
+            Err(e) => return Ok(CallToolResult::error(vec![ContentBlock::text(e)])),
         };
 
         let embed = args.embed_image.unwrap_or(true);
@@ -310,20 +405,14 @@ impl PixServer {
             rtv_index,
             embed_image: embed,
             max_dimension: max_dim,
+            replace_existing: true,
         })
         .await
         {
-            Ok(res) => {
-                let mut content = Vec::new();
-                if let Some(b64) = res.image_b64 {
-                    content.push(Content::image(b64, "image/png"));
-                }
-                content.push(Content::text(res.report.message.clone()));
-                let mut result = CallToolResult::success(content);
-                result.structured_content = serde_json::to_value(&res.report).ok();
-                Ok(result)
-            }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+            Ok(res) => screenshot_call_result(res),
+            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(
+                e.to_string(),
+            )])),
         }
     }
 
@@ -331,8 +420,7 @@ impl PixServer {
         name = "pix_list_counters",
         description = "List the available performance counters for a capture (supports a \
                        case-insensitive filter and a limit).",
-        annotations(title = "List counters", read_only_hint = true),
-        execution(task_support = "optional")
+        annotations(title = "List counters", read_only_hint = true)
     )]
     async fn pix_list_counters(
         &self,
@@ -343,10 +431,10 @@ impl PixServer {
 
     #[tool(
         name = "pix_run_analysis",
-        description = "Replay a capture with the D3D12 debug layer enabled to detect errors, \
-                       warnings, and validation issues.",
-        annotations(title = "Run debug-layer analysis", read_only_hint = true),
-        execution(task_support = "optional")
+        description = "Replay a capture with the D3D12 debug layer enabled and report playback \
+                       diagnostics. pixtool does not export the debug layer's messages, so this \
+                       validates replay rather than claiming a complete error/warning inventory.",
+        annotations(title = "Run debug-layer analysis", read_only_hint = true)
     )]
     async fn pix_run_analysis(
         &self,
@@ -369,7 +457,8 @@ impl PixServer {
 
     #[tool(
         name = "pix_compare_captures",
-        description = "Compare two capture files (size/modification time) for regression detection.",
+        description = "Compare two capture files' size and modification metadata. This does not \
+                       establish a performance regression; compare event timing for that.",
         annotations(title = "Compare captures", read_only_hint = true)
     )]
     async fn pix_compare_captures(
@@ -384,8 +473,7 @@ impl PixServer {
         description = "One-shot workflow: launch an executable, take a GPU capture, and return a \
                        frame-insights summary (and optionally a screenshot). Fewer round-trips \
                        than launch + capture + analyze separately.",
-        annotations(title = "Capture and analyze", destructive_hint = true),
-        execution(task_support = "optional")
+        annotations(title = "Capture and analyze", destructive_hint = true)
     )]
     async fn pix_capture_and_analyze(
         &self,
@@ -404,17 +492,12 @@ impl PixServer {
     }
 }
 
-#[tool_handler(router = self.tool_router)]
-#[task_handler]
 impl ServerHandler for PixServer {
     fn get_info(&self) -> ServerInfo {
-        let mut capabilities = ServerCapabilities::builder()
+        let capabilities = ServerCapabilities::builder()
             .enable_tools()
             .enable_resources()
             .build();
-        // Advertise MCP task support so clients may invoke long-running tools as
-        // durable, pollable tasks (tasks.requests.tools.call).
-        capabilities.tasks = Some(TasksCapability::server_default());
 
         ServerInfo::new(capabilities)
             .with_server_info(
@@ -429,10 +512,45 @@ impl ServerHandler for PixServer {
                  pix_gpu_capture_launch / pix_gpu_capture to record. Analyze with \
                  pix_analyze_frame (heuristic triage), pix_get_event_list (paginated), \
                  pix_get_screenshot (returns the frame as an image), pix_list_counters, and \
-                 pix_run_analysis. Long-running tools support MCP tasks. pix_open_capture opens \
-                 the PIX GUI."
+                 pix_run_analysis (playback validation only; pixtool does not export debug-layer \
+                 messages). Tool cancellation terminates managed pixtool subprocesses. \
+                 pix_open_capture opens the PIX GUI."
                     .to_string(),
             )
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let cancellation = context.ct.clone();
+        let call = self
+            .tool_router
+            .call(ToolCallContext::new(self, request, context));
+
+        // rmcp exposes request cancellation through RequestContext. Selecting
+        // on it here ensures the actual tool future is dropped, which in turn
+        // activates the pixtool process-tree and temporary-artifact guards.
+        tokio::select! {
+            biased;
+            result = call => result,
+            _ = cancellation.cancelled() => {
+                Err(McpError::internal_error("Tool request cancelled", None))
+            }
+        }
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult::with_all_items(self.tool_router.list_all()))
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.tool_router.get(name).cloned()
     }
 
     async fn list_resources(
@@ -440,11 +558,30 @@ impl ServerHandler for PixServer {
         _request: Option<PaginatedRequestParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        Ok(ListResourcesResult {
-            resources: vec![RawResource::new("capture://list", "PIX capture list").no_annotation()],
-            next_cursor: None,
-            meta: None,
-        })
+        Ok(ListResourcesResult::with_all_items(vec![
+            Resource::new("capture://list", "PIX capture list").with_mime_type("application/json"),
+        ]))
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, McpError> {
+        Ok(ListResourceTemplatesResult::with_all_items(vec![
+            ResourceTemplate::new("capture://{id}", "PIX capture")
+                .with_description("Metadata for a .wpix capture in the server capture directory")
+                .with_mime_type("application/json"),
+            ResourceTemplate::new("capture://{id}/metadata", "PIX capture metadata")
+                .with_description("File metadata for a .wpix capture")
+                .with_mime_type("application/json"),
+            ResourceTemplate::new("capture://{id}/events", "PIX capture events")
+                .with_description("A validated capture reference and guidance for event export")
+                .with_mime_type("application/json"),
+            ResourceTemplate::new("capture://{id}/counters", "PIX capture counters")
+                .with_description("A validated capture reference and guidance for counters")
+                .with_mime_type("application/json"),
+        ]))
     }
 
     async fn read_resource(
@@ -454,9 +591,9 @@ impl ServerHandler for PixServer {
     ) -> Result<ReadResourceResult, McpError> {
         let uri = request.uri.clone();
         match resources::read_capture_resource_text(&uri, None).await {
-            Ok(text) => Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                text, uri,
-            )])),
+            Ok(text) => Ok(ReadResourceResult::new(vec![
+                ResourceContents::text(text, uri).with_mime_type("application/json"),
+            ])),
             Err(e) => Err(McpError::resource_not_found(
                 e.to_string(),
                 Some(serde_json::json!({ "uri": uri })),
@@ -465,7 +602,131 @@ impl ServerHandler for PixServer {
     }
 }
 
+impl rmcp::Service<RoleServer> for PixService {
+    async fn handle_request(
+        &self,
+        request: ClientRequest,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ServerResult, McpError> {
+        match request {
+            ClientRequest::CallToolRequest(mut request) => {
+                // Tasks are not advertised. MCP 2025-11-25 requires the
+                // receiver to ignore task metadata and process the call
+                // normally in that case.
+                request.params.task = None;
+                self.server
+                    .call_tool(request.params, context)
+                    .await
+                    .map(ServerResult::CallToolResult)
+            }
+            request => {
+                <PixServer as rmcp::Service<RoleServer>>::handle_request(
+                    &self.server,
+                    request,
+                    context,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn handle_notification(
+        &self,
+        notification: ClientNotification,
+        context: rmcp::service::NotificationContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        <PixServer as rmcp::Service<RoleServer>>::handle_notification(
+            &self.server,
+            notification,
+            context,
+        )
+        .await
+    }
+
+    fn get_info(&self) -> ServerInfo {
+        <PixServer as rmcp::Service<RoleServer>>::get_info(&self.server)
+    }
+}
+
 /// Build a new PIX MCP server instance.
-pub fn create_server() -> PixServer {
-    PixServer::new()
+pub fn create_server() -> PixService {
+    PixService {
+        server: PixServer::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_tool_advertises_structured_output() {
+        let server = PixServer::new();
+        let tools = server.tool_router.list_all();
+
+        assert!(!tools.is_empty());
+        for tool in tools {
+            assert!(
+                tool.output_schema.is_some(),
+                "tool {} is missing outputSchema",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn file_writing_tools_are_not_marked_read_only() {
+        let server = PixServer::new();
+        let tools = server.tool_router.list_all();
+
+        for name in [
+            "pix_gpu_capture",
+            "pix_gpu_capture_launch",
+            "pix_timing_capture",
+            "pix_get_event_list",
+            "pix_get_screenshot",
+        ] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("missing tool {name}"));
+            let annotations = tool.annotations.as_ref().expect("tool annotations");
+            assert_ne!(annotations.read_only_hint, Some(true), "{name}");
+            assert_eq!(annotations.destructive_hint, Some(true), "{name}");
+        }
+    }
+
+    #[test]
+    fn screenshot_response_mirrors_structured_content_as_json_text() {
+        let result = screenshot_call_result(analysis::ScreenshotResult {
+            report: analysis::ScreenshotReport {
+                success: true,
+                output_path: r"C:\captures\frame.png".to_string(),
+                file_size_bytes: 42,
+                message: "Screenshot saved".to_string(),
+                image_embedded: true,
+            },
+            image_b64: Some("cG5n".to_string()),
+        })
+        .expect("screenshot response should serialize");
+
+        let structured = result
+            .structured_content
+            .as_ref()
+            .expect("structured content");
+        assert_eq!(result.content.len(), 2);
+        assert_eq!(result.content[0].as_image().expect("image").data, "cG5n");
+
+        let text = &result.content[1].as_text().expect("JSON text").text;
+        assert_eq!(text, &structured.to_string());
+        let text_json: serde_json::Value =
+            serde_json::from_str(text).expect("text must contain valid JSON");
+        assert_eq!(&text_json, structured);
+    }
+
+    #[test]
+    fn server_does_not_advertise_broken_upstream_task_execution() {
+        let info = PixServer::new().get_info();
+        assert!(info.capabilities.tasks.is_none());
+    }
 }

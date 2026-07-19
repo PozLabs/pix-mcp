@@ -7,15 +7,17 @@ A Model Context Protocol (MCP) server that enables AI agents (GitHub Copilot, Cl
 - **Launch applications with PIX** - Start executables with PIX attached for GPU capture
 - **GPU Captures** - Capture DirectX 12 GPU work to `.wpix` files
 - **Timing Captures** - Record CPU/GPU timing for performance analysis
-- **Capture Analysis** - Extract event lists, counters, screenshots and run debug-layer validation
+- **Capture Analysis** - Extract event lists, counters, screenshots and validate replay with the D3D12 debug layer
 - **Structured results** - Every tool returns typed `structuredContent` with a JSON `outputSchema`
 - **Capture Management** - List and open capture files
 
 ## Prerequisites
 
-1. **Rust** - Install from [rustup.rs](https://rustup.rs)
-2. **Microsoft PIX** - Install from [Microsoft Store](https://apps.microsoft.com/store/detail/pix-on-windows/9PGD9BTP9D71) or [PIX downloads](https://devblogs.microsoft.com/pix/download/)
-3. **Windows SDK** - For Direct3D12 headers (comes with Visual Studio)
+1. **Windows** - PIX and `pixtool.exe` are Windows-only
+2. **Rust 1.88 or newer** - Install from [rustup.rs](https://rustup.rs)
+3. **Microsoft PIX** - Install from [PIX downloads](https://devblogs.microsoft.com/pix/download/)
+4. **Visual Studio 2022 Build Tools** - Install the **Desktop development with C++** workload;
+   it provides the MSVC linker/toolset and Windows SDK required by Rust's Windows MSVC target
 
 ## Installation
 
@@ -25,7 +27,7 @@ git clone https://github.com/pozlabs/pix-mcp.git
 cd pix-mcp
 
 # Build (produces target\release\pix-mcp.exe)
-cargo build --release
+cargo build --locked --release
 ```
 
 ## Usage with AI Agents
@@ -82,7 +84,7 @@ Add to `claude_desktop_config.json`:
 
 | Tool | Description |
 |------|-------------|
-| `pix_list_captures` | List .wpix files in a directory |
+| `pix_list_captures` | List .wpix files with `offset`/`limit` pagination |
 | `pix_open_capture` | Open a capture in PIX GUI |
 
 ### Health & Analysis
@@ -92,23 +94,28 @@ Add to `claude_desktop_config.json`:
 | `pix_status` | Check PIX installation and server health |
 | `pix_analyze_capture` | Analyze .wpix file — extract events, counters, performance data |
 | `pix_analyze_frame` | **Heuristic frame triage** — draw/dispatch/barrier counts, RT changes, top expensive events |
-| `pix_get_event_list` | Extract D3D12 event list (paginated via `offset`/`limit`/`response_format`, or save full CSV) |
-| `pix_list_counters` | List available performance counters (supports `filter`/`limit`) |
-| `pix_run_analysis` | Run debug layer analysis, detect D3D12 errors |
+| `pix_get_event_list` | Extract D3D12 events (`offset`/`limit`; `response_format` selects the 50/500 default; maximum 2000 rows and 1 MiB inline), or save the full list when `output_path` ends with `.csv` |
+| `pix_list_counters` | List available performance counters (`filter`/`limit`; reports `truncated` when bounded) |
+| `pix_run_analysis` | Replay with the D3D12 debug layer to validate playback; pixtool does not export the debug-layer messages |
 | `pix_get_screenshot` | Extract the frame **recorded with the capture** as PNG (`save-screenshot`) and return it inline as an image; `depth`/`marker` options save a render target/depth buffer via replay |
 | `pix_export_counters` | Parse PIX-exported counters (CSV/JSON) |
-| `pix_compare_captures` | Compare two captures for regression detection |
+| `pix_compare_captures` | Compare file-size and modification metadata for two captures (not a performance-regression analysis) |
 
 ## Protocol Features
 
-- **Latest MCP protocol** (`2025-11-25`) via the official [`rmcp`](https://crates.io/crates/rmcp) SDK.
-- **MCP Tasks** — long-running tools (captures, analysis) accept task-augmented calls
-  (`tasks.requests.tools.call`), so clients can poll for deferred results and cancel.
+- **MCP `2025-11-25`** via version 2.2 of the official [`rmcp`](https://docs.rs/rmcp/2.2.0/rmcp/) SDK.
+- **Cancellation-aware** — MCP cancellation drops the active tool future, terminates managed
+  `pixtool` process trees, and cleans up staged artifacts.
+- **Direct calls** — MCP Tasks are not advertised; long-running calls use normal request
+  cancellation and the server's bounded execution timeouts.
 - **Structured output** — every tool advertises a JSON `outputSchema` and returns `structuredContent`.
 - **Image content** — `pix_get_screenshot` returns the rendered frame as an inline image.
-- **Elicitation** — a missing `output_path` is requested interactively when the client supports
-  elicitation; otherwise a clear, model-correctable tool error is returned.
-- **Token-efficient** — list tools paginate and can write full data to files instead of inlining it.
+- **Elicitation** — when a tool requires a destination, a missing `output_path` is requested
+  interactively if the client supports elicitation; otherwise a clear, model-correctable tool
+  error is returned. (`pix_get_event_list` can omit it to receive inline rows.)
+- **Token-efficient** — `pix_get_event_list` paginates inline rows and can write the full list to
+  CSV; `pix_list_captures` defaults to 100 rows (maximum 500), and `pix_list_counters` supports
+  filtering and a bounded result limit.
 
 ## pixtool compatibility (2603.25)
 
@@ -119,18 +126,53 @@ affect this server:
 - **Analysis needs Developer Mode.** `save-event-list`, `save-screenshot`, `save-resource`,
   `list-counters`, and `run-debug-layer` fail without Windows Developer Mode; the server detects
   this and returns actionable guidance. Capturing does not need it.
-- **App arguments with spaces / leading `-`/`+` can't be passed via `--command-line`** on 2603.25.
-  The capture tools still send them, but warn in the result; prefer the app's own `autoexec`/config
-  file or an environment variable to select a level/mode.
+- **Application arguments are validated before launch.** pixtool 2603.25 cannot faithfully
+  represent arguments containing spaces, values beginning with `-` or `+`, quotes, or control
+  characters through `--command-line`; the server rejects them instead of launching the target
+  with altered arguments. Use the application's config/`autoexec` file or an environment variable
+  to select a level or mode. In practice, only one non-empty, unprefixed token is safely supported.
 - **GPU capture by PID requires launch-under-PIX** (`pix_gpu_capture` only works on a process PIX
   launched). Use `pix_gpu_capture_launch` / `pix_capture_and_analyze` for a normal game.
-- **Timing capture `duration_ms` is in milliseconds** (pixtool default 100).
+- **Capture bounds are validated.** `frames` defaults to pixtool's default of 1 and accepts
+  `1..=120`; timing-capture `duration_ms` defaults to 100 milliseconds and accepts `1..=600000`.
+- **`pix_run_analysis` validates replay, not the complete diagnostic stream.** The
+  `run-debug-layer` verb replays with the D3D12 debug layer but does not export its messages, so an
+  empty issue list must not be interpreted as proof that the debug layer emitted no diagnostics.
+- **Processes are bounded.** Foreground operations use a two-process pool and wait up to 30 seconds
+  for capacity before their execution timeout starts. Background launches use a separate
+  four-process pool; a fifth concurrent
+  background launch fails immediately instead of waiting. Foreground operations time out after
+  10 minutes, background launches after 30 minutes, and timing captures after their requested
+  duration plus 30 seconds. Timed-out processes and cancelled foreground processes are terminated.
+- **Analysis outputs are staged safely.** Event-list CSV and screenshot PNG outputs are written to
+  isolated temporary directories, parsed/decoded to validate them, and only then replace the
+  requested destination. New `.wpix` captures are likewise written to isolated same-filesystem paths,
+  verified as non-empty, and persisted with no-clobber semantics. Existing capture destinations are
+  never overwritten, and partial temporary files are cleaned up. The screenshot path derived by
+  `pix_capture_and_analyze` is also no-clobber; an existing PNG becomes a non-fatal warning.
+- **Event-list file output is type-safe.** `pix_get_event_list.output_path` must end with `.csv`;
+  other extensions are rejected to avoid overwriting a capture or unrelated file. File-backed CSV
+  validation is streamed and capped at 128 MiB.
+- **Capture output paths are type-safe.** A missing extension is normalized to `.wpix`; a
+  conflicting extension or directory path is rejected. Screenshot paths gain a final `.png` when
+  it is absent.
+- **Responses and scans are bounded.** Inline event pages and analysis reports are capped at 1 MiB;
+  counter lists expose `truncated` when their item/byte budget is reached. Capture-directory scans
+  reject directories with more than 20,000 entries.
+
+## Trust Model
+
+Run this server only for a trusted MCP client. The tools intentionally inherit the server user's
+local permissions: a client can launch an executable chosen by path, interact with processes, read
+capture/counter files, and read or write requested local paths. The server validates inputs and
+output artifacts, but it is not a sandbox and does not implement a path or executable allowlist.
+Do not expose it to untrusted or multi-tenant clients.
 
 ## MCP Resources
 
 | Resource URI | Description |
 |--------------|-------------|
-| `capture://list` | List all available captures |
+| `capture://list` | List up to 500 captures in the server's current working directory (`directory`, `total_count`, and `truncated` are returned) |
 | `capture://{id}` | Get metadata for a specific capture |
 | `capture://{id}/metadata` | Get file metadata for a capture |
 | `capture://{id}/events` | Hint to use the `pix_get_event_list` tool |
@@ -179,8 +221,8 @@ Agent: "Debug the rendering issue in my game"
 > launched for GPU Capture`. `pix_launch` returns pixtool's launcher PID, not the
 > game's, and does not leave a process you can later capture by PID.
 >
-> Tip: pass `frames: 1` to the capture tools to bound the capture and let the
-> launched app close promptly.
+> Tip: `frames` already defaults to 1, matching pixtool. Increase it only when a
+> multi-frame capture is intentional (maximum 120).
 
 ## Environment Variables
 
@@ -216,17 +258,23 @@ Agent: "Debug the rendering issue in my game"
 ## Development
 
 ```powershell
-cargo build      # debug build
-cargo test       # run tests
-cargo clippy     # lints
-cargo run        # run the server over stdio
+cargo fmt --check
+cargo build --locked --all-targets --all-features
+cargo test --locked --all-targets --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo audit
+cargo run --locked --all-features # run the server over stdio
 ```
+
+Install the audit subcommand once with `cargo install cargo-audit --locked` if it is not already
+available.
 
 See [SETUP.md](SETUP.md) for prerequisites and how to test with the MCP Inspector.
 
 ## Contributing
 
-Issues and pull requests are welcome. Before opening a PR, please run `cargo fmt`, `cargo clippy`, and `cargo test`.
+Issues and pull requests are welcome. Before opening a PR, run the formatting, build, test, Clippy,
+and audit commands above.
 
 ## License
 
